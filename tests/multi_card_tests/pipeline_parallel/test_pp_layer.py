@@ -16,11 +16,16 @@ import unittest
 from dataclasses import dataclass
 
 import numpy as np
+import paddle
 from paddle import nn
 from paddle.distributed import fleet
 from paddle.nn import Layer
 
-from paddlefleet.pipeline_parallel import LayerDesc, PipelineLayer
+from paddlefleet.pipeline_parallel import (
+    LayerDesc,
+    NoPipelineParallel,
+    PipelineLayer,
+)
 from paddlefleet.spec_utils import LayerSpec, build_layer
 from paddlefleet.transformer.identity_op import IdentityOp
 
@@ -65,8 +70,8 @@ def get_alex_spec(num_classes=10):
                 LayerSpec(
                     layer=nn.Conv2D,
                     extra_kwargs={
-                        "in_channels": 1,
-                        "out_channels": 64,
+                        "in_channels": 3,
+                        "out_channels": 3,
                         "kernel_size": 11,
                         "stride": 4,
                         "padding": 5,
@@ -82,8 +87,8 @@ def get_alex_spec(num_classes=10):
                 LayerSpec(
                     layer=nn.Conv2D,
                     extra_kwargs={
-                        "in_channels": 64,
-                        "out_channels": 129,
+                        "in_channels": 3,
+                        "out_channels": 3,
                         "kernel_size": 5,
                         "padding": 2,
                     },
@@ -98,8 +103,8 @@ def get_alex_spec(num_classes=10):
                 LayerSpec(
                     layer=nn.Conv2D,
                     extra_kwargs={
-                        "in_channels": 192,
-                        "out_channels": 384,
+                        "in_channels": 3,
+                        "out_channels": 3,
                         "kernel_size": 3,
                         "padding": 1,
                     },
@@ -110,8 +115,8 @@ def get_alex_spec(num_classes=10):
                 LayerSpec(
                     layer=nn.Conv2D,
                     extra_kwargs={
-                        "in_channels": 384,
-                        "out_channels": 256,
+                        "in_channels": 3,
+                        "out_channels": 3,
                         "kernel_size": 3,
                         "padding": 1,
                     },
@@ -122,8 +127,8 @@ def get_alex_spec(num_classes=10):
                 LayerSpec(
                     layer=nn.Conv2D,
                     extra_kwargs={
-                        "in_channels": 256,
-                        "out_channels": 256,
+                        "in_channels": 3,
+                        "out_channels": 3,
                         "kernel_size": 3,
                         "padding": 1,
                     },
@@ -160,6 +165,7 @@ class TestPipeLayerAPI(unittest.TestCase):
             "mp_degree": 1,
             "pp_degree": self.pipeline_parallel_size,
         }
+        self.strategy = strategy
         fleet.init(is_collective=True, strategy=strategy)
         self.hcg = fleet.get_hybrid_communicate_group()
 
@@ -174,6 +180,12 @@ class TestPipeLayerAPI(unittest.TestCase):
         alex_desc = get_alex_spec()
         pipe_model = build_layer(alex_desc, num_stages=1)
         np.testing.assert_array_equal(len(pipe_model.parameters()), 12)
+        pipe_model = NoPipelineParallel(pipe_model, self.strategy)
+        data = {
+            "input": [paddle.randn([256, 3, 224, 224])],
+            "label": [paddle.randint(0, 10, [147, 1])],
+        }
+        pipe_model.forward_backward_pipeline(data)
 
     def test_pipelayer_segment_method_list(self):
         alex_desc = get_alex_spec()
