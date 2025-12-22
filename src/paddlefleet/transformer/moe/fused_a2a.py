@@ -248,6 +248,8 @@ class FusedDispatch(PyLayer):
         group,
         previous_event=None,
         fp8_dispatch: bool = False,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
     ):
         """Forward pass of fused dispatch."""
         if fp8_dispatch:
@@ -261,12 +263,21 @@ class FusedDispatch(PyLayer):
             scale = scale.T
             x = (x_fp8, scale)
         recv_x, recv_token_probs, states, event = fused_dispatch_forward_func(
-            x, token_indices, token_probs, num_experts, group, previous_event
+            x,
+            token_indices,
+            token_probs,
+            num_experts,
+            group,
+            previous_event,
+            async_finish,
+            allocate_on_comm_stream,
         )
 
         ctx.group = group
         ctx.handle = states["handle"]
         ctx.event = event
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
         ctx.set_grad_in_dtype_consistent(False)
         if fp8_dispatch:
             recv_x, scale = recv_x
@@ -277,7 +288,13 @@ class FusedDispatch(PyLayer):
     def backward(ctx, grad_output, grad_token_probs):
         """Backward pass of fused dispatch."""
         return fused_dispatch_backward_func(
-            grad_output, grad_token_probs, ctx.group, ctx.handle
+            grad_output,
+            grad_token_probs,
+            ctx.group,
+            ctx.handle,
+            None,  # previous_event
+            ctx.async_finish,
+            ctx.allocate_on_comm_stream,
         )
 
 
@@ -285,7 +302,15 @@ class FusedCombine(PyLayer):
     """Fused combine operation for MoE output combining computation and communication."""
 
     @staticmethod
-    def forward(ctx, x, group, states, previous_event=None):
+    def forward(
+        ctx,
+        x,
+        group,
+        states,
+        previous_event=None,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
         """Forward pass of fused combine."""
         combined_x = fused_combine_forward_func(
             x, group, states, previous_event
@@ -294,6 +319,8 @@ class FusedCombine(PyLayer):
         ctx.handle = states["handle"]
         ctx.group = group
         ctx.previous_event = previous_event
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
 
         return combined_x
 
@@ -301,7 +328,12 @@ class FusedCombine(PyLayer):
     def backward(ctx, grad_output):
         """Backward pass of fused combine."""
         return fused_combine_backward_func(
-            grad_output, ctx.group, ctx.handle, ctx.previous_event
+            grad_output,
+            ctx.group,
+            ctx.handle,
+            ctx.previous_event,
+            ctx.async_finish,
+            ctx.allocate_on_comm_stream,
         )
 
 
@@ -362,6 +394,8 @@ if HAVE_DEEP_EP:
         group: Group,
         previous_event=None,
         fp8_dispatch: bool = False,
+        async_finish=False,
+        allocate_on_comm_stream=False,
     ):
         """Perform fused dispatch operation if deep_ep is available.
 
@@ -384,10 +418,17 @@ if HAVE_DEEP_EP:
             group,
             previous_event,
             fp8_dispatch,
+            async_finish,
+            allocate_on_comm_stream,
         )
 
     def fused_combine(
-        x, group, handle, previous_event=None, combine_overlap_handle=None
+        x,
+        group,
+        handle,
+        previous_event=None,
+        combine_overlap_handle=None,
+        async_finish=False,
     ):
         """Perform fused combine operation if deep_ep is available.
 
@@ -403,7 +444,9 @@ if HAVE_DEEP_EP:
         states = {}
         states["handle"] = handle
         if combine_overlap_handle is None:
-            return FusedCombine.apply(x, group, states, previous_event)
+            return FusedCombine.apply(
+                x, group, states, previous_event, async_finish
+            )
         else:
             assert previous_event is None
             assert isinstance(combine_overlap_handle, dict)
