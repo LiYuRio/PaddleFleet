@@ -184,10 +184,9 @@ class GPTLMHead(ColumnParallelLinear):
                     )
             self.weight.is_distributed = True if self.world_size > 1 else False
 
-        # Final Block Attention Residual (applied before LM head projection)
-        self.block_attn_res = build_spec_layer(
-            block_attn_res_spec, config=self.config
-        )
+        # Final Block Attention Residual — skipped (last full attention layer
+        # and MTP layers use standard residual, no final block attn res needed).
+        self.block_attn_res = IdentityOp()
 
         # Multimax: learnable SegLU-style modulation on logits before softmax.
         # Names contain the "multimax" substring so the trainer's no-decay
@@ -312,10 +311,9 @@ class GPTLMHead(ColumnParallelLinear):
     def forward(self, dict_args: dict):
         hidden_states = dict_args["hidden_states"]
 
-        # Apply final Block Attention Residual if enabled
-        if self.config.block_attention_residuals:
-            blocks = dict_args.get("blocks", [])
-            hidden_states = self.block_attn_res(hidden_states, blocks)
+        # Block Attention Residual in LM head is skipped — the last full
+        # attention layer already uses standard residual, so no final
+        # block attn res is needed here.
 
         if (
             self.config.num_nextn_predict_layers is not None
@@ -359,14 +357,11 @@ class GPTLMHead(ColumnParallelLinear):
 
 
 class GPTMainLMHead(GPTLMHead):
-    """主干网 LM Head: 含 block_attn_res, 只做单次预测。"""
+    """主干网 LM Head: 只做单次预测。block_attn_res 已跳过。"""
 
     def __init__(self, **kwargs):
-        block_attn_res_spec = kwargs.pop("block_attn_res", IdentityOp)
+        kwargs.pop("block_attn_res", None)
         super().__init__(**kwargs)
-        self.block_attn_res = build_spec_layer(
-            block_attn_res_spec, config=self.config
-        )
 
     def build_schedule_node(self):
         return ScheduleNode(self.forward, name="GPTMainLMHead")
@@ -374,9 +369,6 @@ class GPTMainLMHead(GPTLMHead):
     def forward(self, dict_args: dict):
         hidden_states = dict_args["hidden_states"]
         mtp_loss = dict_args.get("mtp_loss", None)
-        if self.config.block_attention_residuals:
-            blocks = dict_args.get("blocks", [])
-            hidden_states = self.block_attn_res(hidden_states, blocks)
 
         tensor_list = paddle.split(
             hidden_states,
