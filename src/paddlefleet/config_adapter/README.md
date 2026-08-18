@@ -173,6 +173,7 @@ C/E/M 全部不通过时，报错会给出候选淘汰明细和最近的合法�
 |---|---|---|---|
 | yaml | `csa_sparse_attn_backend` | `tilelang` | HCA/CSA 的 cudnn 后端（FlashMLA 前向 + cuDNN 反向）与 tilelang 结果不一致 |
 | yaml | `csa_indexer_backend` | `tilelang` | indexer 的 cudnn top-k 与 tilelang 有差异，与上一项取齐 |
+| yaml | `mqa_sparse_attn_backward_backend` | `tilelang` | absorbed-MQA（`csa_compress_ratios=-2`）层的 dKV 反向默认走 cuDNN，原子累加不可逐位复现 |
 | json | `multimax_modules` | `null` | multimax 的可学习 range/ts 引入非确定性 |
 
 新增开关只需在 `precision.py` 的 `PRECISION_SWITCHES` 里加一行，报告与日志会自动
