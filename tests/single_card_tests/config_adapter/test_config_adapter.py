@@ -230,6 +230,27 @@ class TestPrecisionSwitches(unittest.TestCase):
         _applied, skipped = plan_precision_switches({}, None)
         self.assertTrue(any("multimax_modules" in note for note in skipped))
 
+    def test_mqa_backward_backend_is_pinned_even_when_absent(self):
+        # The absorbed-MQA dKV backward defaults to cuDNN, whose atomic
+        # accumulation is not bit-reproducible, so accuracy runs must pin it
+        # like the two CSA backends -- including when no document declares it
+        # yet, which is the common case for existing YAMLs.
+        applied, skipped = plan_precision_switches({}, {})
+        self.assertIn(
+            ("yaml", "mqa_sparse_attn_backward_backend", "tilelang"),
+            [(t, k, v) for t, k, v, _r in applied],
+        )
+        self.assertEqual(skipped, [])
+
+    def test_mqa_backward_backend_follows_the_declaring_document(self):
+        applied, _skipped = plan_precision_switches(
+            {"mqa_sparse_attn_backward_backend": "cudnn"},
+            {"mqa_sparse_attn_backward_backend": "cudnn"},
+        )
+        targets = {(t, k) for t, k, _v, _r in applied}
+        self.assertIn(("yaml", "mqa_sparse_attn_backward_backend"), targets)
+        self.assertIn(("json", "mqa_sparse_attn_backward_backend"), targets)
+
 
 class TestOverrideParsing(unittest.TestCase):
     """``--set`` may name its target file, or let the tool decide."""
@@ -865,6 +886,9 @@ class TestAccuracySwitch(ConfigAdapterTestBase):
         self.assertEqual(config["global_batch_size"], 192)
         self.assertEqual(config["gradient_accumulation_steps"], 192)
         self.assertEqual(config["csa_sparse_attn_backend"], "tilelang")
+        # Written even though the source YAML never declared it: the field's
+        # own default is the non-deterministic cuDNN backward.
+        self.assertEqual(config["mqa_sparse_attn_backward_backend"], "tilelang")
         self.assertIsNone(self.load_output_json(8)["multimax_modules"])
         self.assertIn("精度对齐", message)
 

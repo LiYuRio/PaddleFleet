@@ -1254,6 +1254,22 @@ class TransformerConfig(ModelParallelConfig):
         kernel.
     """
 
+    mqa_sparse_attn_backward_backend: str = "cudnn"
+    """Backward kernel for the absorbed-MQA latent sparse attention (dkv).
+
+    One of {"cudnn", "tilelang"}:
+      * "cudnn" (default): cuDNN DSA backward. Fast, but ``dkv`` accumulates
+        with atomics and is **not** run-to-run reproducible; the drift is
+        bounded by ``test_block_sparse_dsa_gradcheck.py::TestDeterminism``.
+      * "tilelang": deterministic backward via
+        ``tilelang_ops.attn.mqa_latent_sparse_bwd``. ~14x slower on SM100 and
+        bitwise stable for identical inputs, independent of
+        ``FLAGS_cudnn_deterministic`` -- it always runs the atomic-free kernel
+        rather than selecting one from that flag.
+    The forward is always FlashMLA regardless of this switch; the tilelang
+    forward kernel cannot accept ``d_qk=576`` (not a power of two).
+    """
+
     csa_share_docmask_meta: bool = False
     """Share one ``CSADocMaskMetadata`` per (micro-batch, ratio, mask group).
 
@@ -1373,6 +1389,7 @@ class TransformerConfig(ModelParallelConfig):
         "qk_pos_emb_head_dim": "qk_pos_emb_head_dim",
         "hca_rope_type": "hca_rope_type",
         "csa_rope_type": "csa_rope_type",
+        "mqa_sparse_attn_backward_backend": "mqa_sparse_attn_backward_backend",
     }
 
     # Config keys that were renamed and deliberately left without a silent
@@ -2008,6 +2025,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"csa_sparse_attn_backend={self.csa_sparse_attn_backend!r} is invalid. "
                     "Must be one of {'unfused', 'tilelang', 'cudnn'}."
+                )
+            if self.mqa_sparse_attn_backward_backend not in {
+                "cudnn",
+                "tilelang",
+            }:
+                raise ValueError(
+                    f"mqa_sparse_attn_backward_backend="
+                    f"{self.mqa_sparse_attn_backward_backend!r} is invalid. "
+                    "Must be one of {'cudnn', 'tilelang'}."
                 )
 
             # Per-attention-type RoPE variant validation (HCA / CSA).
