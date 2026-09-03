@@ -28,6 +28,7 @@ import triton
 from .cross_entropy import (
     liger_cross_entropy_kernel,
     liger_cross_entropy_multimax_kernel,
+    liger_cross_entropy_multimax_tuned_kernel,
 )
 from .utils import element_mul_kernel
 
@@ -68,6 +69,63 @@ def _select_ce_launch_config(n_cols):
     return block_size, num_warps
 
 
+# --- multimax CE kernel: its own launch config -------------------------------
+# The tuning above was found on the *non*-multimax CE kernel and is not optimal
+# for the multimax variant, because the two are limited by different things:
+#   * non-multimax: pass 2 is only softmax-grad plus one store, 32 registers.
+#     2048/4 measured 6.62 ms; 1024/1 is 3.6% slower (6.87 ms).
+#   * multimax: pass 2 carries eight in-block reductions for the param grads.
+#     With num_warps > 1 every ``tl.sum`` goes through shared memory and a
+#     BAR.SYNC (SASS at 2048/4: 24 BAR.SYNC and 56 SHFL per pass-2 iteration),
+#     while at num_warps=1 a block is a single warp and the reduction degenerates
+#     to warp shuffles with no barrier and no shared memory at all.
+# Measured (B30Z, BT=32768, V=201216, bf16, num_chunks=1, no other process on
+# the card, median of 15, drift checked at 0.015 ms either side):
+#     2048/4  25.13 ms  regs=128 spill=0  512 threads/SM
+#     1024/1  13.64 ms  regs= 70 spill=0  896 threads/SM      x1.84
+# Other points swept: 512/1 17.07, 256/1 16.54, 2048/2 21.37, 1024/2 24.58,
+# 2048/1 spilled 286 instructions (22.2 ms), 4096/1 spilled 1244 (182 ms).
+# 1024 is the knee: larger pushes the tile out of registers, smaller raises the
+# iteration count and with it the fixed per-iteration reduction cost.
+# Note that at num_warps=1 each thread owns 1024/32 = 32 columns, twice
+# CE_ELEMENTS_PER_THREAD, and still does not spill -- what decides register
+# pressure here is whether the accumulators are *scalars* (eight scalar
+# accumulators versus eight tile-wide ones: the latter spills 254 instructions
+# at a 1024 tile and is 3.2x slower). So that per-thread budget applies to the
+# non-multimax path only; do not carry it over.
+#
+# When the multimax parameters are frozen (HAS_MULTIMAX_GRADIENTS=False, the
+# freeze-head case) all eight reductions disappear and the best tile shrinks
+# with them -- again a register-allocation effect:
+#     old 2048/4          15.20 ms
+#     new 1024/1          15.43 ms  regs=168  384 threads/SM  <- slower than old
+#     new  512/1          12.16 ms  regs= 88  640 threads/SM  <- x1.25
+# Hence two tiers keyed on whether param grads are needed, not a single value.
+CE_MULTIMAX_BLOCK_SIZE_CAP = 1024
+CE_MULTIMAX_BLOCK_SIZE_CAP_NO_PARAM_GRAD = 512
+CE_MULTIMAX_NUM_WARPS = 1
+
+
+def _select_ce_multimax_launch_config(n_cols, has_param_grads=True):
+    """(BLOCK_SIZE, num_warps) for ``liger_cross_entropy_multimax_tuned_kernel``.
+
+    num_warps is pinned to 1 so the eight param-grad reductions stay inside one
+    warp (no BAR.SYNC, no shared memory); the tile cap has two tiers keyed on
+    whether this call computes param grads. Numbers in the comment above.
+
+    This is only reachable with ``config.liger_ce_multimax_tuning`` on, and it
+    goes together with the tuned kernel body -- the body is what lets 1024/1
+    compile without spilling, so the two are not independently selectable.
+    """
+    cap = (
+        CE_MULTIMAX_BLOCK_SIZE_CAP
+        if has_param_grads
+        else CE_MULTIMAX_BLOCK_SIZE_CAP_NO_PARAM_GRAD
+    )
+    block_size = min(MAX_FUSED_SIZE, triton.next_power_of_2(n_cols), cap)
+    return block_size, CE_MULTIMAX_NUM_WARPS
+
+
 def fused_linear_cross_entropy_forward(
     _input,
     weight,
@@ -79,6 +137,7 @@ def fused_linear_cross_entropy_forward(
     ec_align=False,
     multimax_ranges=None,
     multimax_ts=None,
+    liger_ce_multimax_tuning=False,
 ):
     """前向：分 chunk 计算 logits / loss / grad_input / grad_weight。
 
@@ -201,7 +260,15 @@ def fused_linear_cross_entropy_forward(
         target_chunk = target_chunk.contiguous()
 
         if use_multimax:
-            liger_cross_entropy_multimax_kernel[(n_rows,)](
+            if liger_ce_multimax_tuning:
+                mm_kernel = liger_cross_entropy_multimax_tuned_kernel
+                mm_block, mm_warps = _select_ce_multimax_launch_config(
+                    V, has_param_grads=multimax_requires_grad
+                )
+            else:
+                mm_kernel = liger_cross_entropy_multimax_kernel
+                mm_block, mm_warps = BLOCK_SIZE, ce_num_warps
+            mm_kernel[(n_rows,)](
                 X_ptr=logits_chunk,
                 X_stride=logits_chunk.stride(-2),
                 Y_ptr=target_chunk,
@@ -224,8 +291,8 @@ def fused_linear_cross_entropy_forward(
                 reduction=reduction,
                 HAS_GRADIENTS=needs_grad_logits,
                 HAS_MULTIMAX_GRADIENTS=multimax_requires_grad,
-                BLOCK_SIZE=BLOCK_SIZE,
-                num_warps=ce_num_warps,
+                BLOCK_SIZE=mm_block,
+                num_warps=mm_warps,
             )
         else:
             liger_cross_entropy_kernel[(n_rows,)](
@@ -393,6 +460,10 @@ class LigerFusedLinearCrossEntropyFunction(paddle.autograd.PyLayer):
         ec_align = args[7]
         multimax_ranges = args[8] if len(args) > 8 else None
         multimax_ts = args[9] if len(args) > 9 else None
+        # Appended after the multimax operands rather than inserted, so every
+        # existing positional caller keeps its meaning and gets the default
+        # (off = today's kernel and launch geometry).
+        liger_ce_multimax_tuning = args[10] if len(args) > 10 else False
 
         ret = fused_linear_cross_entropy_forward(
             _input=_input,
@@ -405,6 +476,7 @@ class LigerFusedLinearCrossEntropyFunction(paddle.autograd.PyLayer):
             ec_align=ec_align,
             multimax_ranges=multimax_ranges,
             multimax_ts=multimax_ts,
+            liger_ce_multimax_tuning=liger_ce_multimax_tuning,
         )
         # Handle both 4-tuple (multimax disabled) and 6-tuple (enabled)
         if len(ret) == 4:

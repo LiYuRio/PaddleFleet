@@ -1244,7 +1244,12 @@ class MQALatentAttention(FleetLayer):
         q_dim = int(query.shape[-1])
         self._assert_dense_fa4(q_dim, kv_lora_rank, row_end)
         core_out = self._dense_attn(query, kv, row_end, kv_lora_rank)
-        return self._deabsorb(core_out, v_b_proj_weight, self.split_kv_b)
+        return self._deabsorb(
+            core_out,
+            v_b_proj_weight,
+            self.split_kv_b,
+            getattr(self.config, "grouped_matmul_deep_gemm", False),
+        )
 
     # ------------------------------------------------------------------
     # warmup (phase 2)
@@ -2042,7 +2047,9 @@ class MQALatentAttention(FleetLayer):
         )
 
     @staticmethod
-    def _deabsorb(core_out, v_b_proj_weight, split_kv_b=False) -> Tensor:
+    def _deabsorb(
+        core_out, v_b_proj_weight, split_kv_b=False, use_deep_gemm=False
+    ) -> Tensor:
         """``[b, s, h * kv_lora_rank]`` -> ``[b, s, h * v_head_dim]``."""
         b, s, _ = core_out.shape
         if split_kv_b:
@@ -2052,7 +2059,9 @@ class MQALatentAttention(FleetLayer):
 
             h, v_head_dim, kv_lora_rank = v_b_proj_weight.shape
             out = fused_grouped_matmul(
-                core_out.reshape([b, s, h, kv_lora_rank]), v_b_proj_weight
+                core_out.reshape([b, s, h, kv_lora_rank]),
+                v_b_proj_weight,
+                use_deep_gemm=use_deep_gemm,
             )
         else:
             kv_lora_rank, h, v_head_dim = v_b_proj_weight.shape
@@ -2232,7 +2241,12 @@ class MQALatentAttention(FleetLayer):
             core_out = self._sparse_attn(
                 query, kv, token_indices, self.softmax_scale, kv_lora_rank
             )
-        output = self._deabsorb(core_out, v_b_proj_weight, self.split_kv_b)
+        output = self._deabsorb(
+            core_out,
+            v_b_proj_weight,
+            self.split_kv_b,
+            getattr(self.config, "grouped_matmul_deep_gemm", False),
+        )
         if not need_loss:
             return output
 

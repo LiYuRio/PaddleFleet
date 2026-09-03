@@ -275,6 +275,13 @@ class LanguageLoss(FleetLayer):
             if multimax_ranges is not None and multimax_ts is not None:
                 apply_args.append(multimax_ranges)
                 apply_args.append(multimax_ts)
+            else:
+                # Pad so the tuning flag lands at its fixed position; ``None``
+                # here is exactly what the PyLayer already defaults to.
+                apply_args.extend([None, None])
+            apply_args.append(
+                getattr(self.config, "liger_ce_multimax_tuning", False)
+            )
             loss_1d = LigerFusedLinearCrossEntropyFunction.apply(*apply_args)
             # Reshape back to [B, S] so downstream CP gather / lossmask
             # handling matches the non-fused path exactly.

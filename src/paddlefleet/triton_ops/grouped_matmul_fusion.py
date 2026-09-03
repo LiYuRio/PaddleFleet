@@ -21,6 +21,11 @@ that runs on bf16 Tensor Core (no f32 upcast, no internal transpose).
 Forward:  out[g, m, :] = x[g, m, :] @ w[g, :, :]^T   for each group g
 Backward: dx[g, m, :] = dy[g, m, :] @ w[g, :, :]      for each group g
           dw[g, r, :] = dy[g, :, r]^T @ x[g, :, :]     for each group g
+
+Two of the three contractions are also available as hardcoded bf16 kernels in
+DeepGEMM (``einsum.hpp``); ``_dg_run`` dispatches to those when the operand
+layout allows it, and the Triton kernels below stay as the fallback and as the
+only implementation of the weight gradient. See ``_DG_EXPR`` and ``_TUNED``.
 """
 
 from functools import partial
@@ -39,6 +44,197 @@ import triton.language as tl
 # fp32) falls back to paddle.einsum in fused_grouped_matmul so it is not
 # silently downcast to fp16.
 _SUPPORTED_DTYPES = (paddle.float16, paddle.bfloat16)
+
+# --------------------------------------------------------------------------
+# DeepGEMM dispatch
+#
+# DeepGEMM hardcodes three bf16 Einstein sums (``einsum.hpp:124-135``). Two of
+# them are exactly the contractions this file computes -- written with DeepGEMM's
+# letters on the left and this file's names on the right:
+#
+#   forward   out[m,g,r] = sum_d x[m,g,d] w[g,r,d]
+#             "bhr,hdr->bhd" is  D[b,h,d] = sum_r A[b,h,r] B[h,d,r]
+#             (b,h) = (m,g); DeepGEMM's contracted index r is our D,
+#             DeepGEMM's free index d is our R:
+#                 A = x   [M,G,D]   B = w [G,R,D]   D = out [M,G,R]
+#
+#   dx        dx[m,g,d] = sum_r dy[m,g,r] w[g,r,d]
+#             "bhd,hdr->bhr" is  D[b,h,r] = sum_d A[b,h,d] B[h,d,r]
+#             (b,h) = (m,g); DeepGEMM's contracted index d is our R,
+#             DeepGEMM's free index r is our D:
+#                 A = dy  [M,G,R]   B = w [G,R,D]   D = dx  [M,G,D]
+#
+# Note that ``w`` is the *same* tensor, in the same layout, in both -- the two
+# expressions differ only in which of B's two trailing axes is contracted, which
+# is why no transpose or repack is needed on either side. The expression string
+# is matched literally (``einsum.hpp:122-123`` has "TODO: support any
+# expression / canonicalize expression"), so these two spellings are the only
+# ones that reach the kernels.
+#
+# The weight gradient dw[g,r,d] = sum_m dy[m,g,r] x[m,g,d] would be
+# "bhd,bhr->hdr", which exists in ``fp8_einsum`` (einsum.hpp:202) but *not* in
+# the bf16 ``einsum``; it stays on Triton.
+_DG_EXPR = {"fwd": "bhr,hdr->bhd", "dx": "bhd,hdr->bhr"}
+
+# bf16 elements per 16 B. cuBLASLt wants 16 B-aligned leading dimensions.
+_DG_ALIGN = 8
+
+# The DeepGEMM path is opt-in per call via ``use_deep_gemm`` (config field
+# ``grouped_matmul_deep_gemm``, off by default) because it replaces the
+# accumulation with another library's, whereas the tuned Triton meta params
+# below are bit-identical and therefore unconditional. ``_dg_run`` still fails
+# closed on anything it cannot describe, so passing True is a request, not an
+# assertion that DeepGEMM will be used.
+_DG_EINSUM = None  # None = not probed yet, False = unavailable
+
+
+def _dg_einsum():
+    """DeepGEMM's bf16 einsum entry point, or None if unusable.
+
+    Probed lazily on first use: importing ``paddlefleet_ops`` pulls in the whole
+    ecosystem (deep_ep / sonicmoe / flash_mla ...) and widens paddle's
+    torch-compat scope, neither of which should happen merely because something
+    imported ``paddlefleet.triton_ops``.
+    """
+    global _DG_EINSUM
+    if _DG_EINSUM is None:
+        _DG_EINSUM = False
+        try:
+            import paddlefleet_ops
+            from paddlefleet_ops import deep_gemm
+
+            if paddlefleet_ops.is_deep_gemm_available():
+                _DG_EINSUM = getattr(deep_gemm, "einsum", False)
+        except (ImportError, RuntimeError, AttributeError):
+            pass
+    return _DG_EINSUM or None
+
+
+def _dg_batched(t, m, g, k):
+    """``[..., G, K]`` -> a 3-D ``[M, G, K]`` view DeepGEMM can read, else None.
+
+    ``einsum.hpp:67-69`` only requires bf16 and ``stride(2) == 1``, but the
+    cuBLASLt path then reads ``stride(0)`` as a leading dimension and
+    ``stride(1)`` as a strided-batch offset, so the view is a faithful
+    description of the data exactly when the groups do not overlap
+    (``stride(1) >= K`` and ``stride(0) >= G * stride(1)``) and both of those are
+    16 B aligned. Everything else keeps the Triton kernel, which takes each
+    stride explicitly and has no such requirement.
+    """
+    v = t if len(t.shape) == 3 else t.reshape([m, g, k])
+    if v.data_ptr() != t.data_ptr():
+        return None  # the reshape materialized a copy: not free, not worth it
+    sm, sg, sk = v.strides
+    if sk != 1 or sg < k or sm < g * sg:
+        return None
+    if sm % _DG_ALIGN or sg % _DG_ALIGN:
+        return None
+    return v
+
+
+def _dg_weight_ok(w):
+    """The ``hdr`` operand: 3-D, unit last stride, 16 B-aligned strides."""
+    return (
+        len(w.shape) == 3
+        and w.strides[2] == 1
+        and not (w.strides[0] % _DG_ALIGN or w.strides[1] % _DG_ALIGN)
+    )
+
+
+def _dg_run(which, a, w, d, m, g, k_a, k_d):
+    """Try DeepGEMM for ``which`` in {"fwd", "dx"}; True if it ran the GEMM.
+
+    ``use_cublaslt=True`` because it is the faster of DeepGEMM's two paths here.
+    Measured per launch at G=8 M=32768 R=768 D=1536 bf16 on B30Z (sm_103), in
+    real 8-card training, median over 8 devices x 720/360 launches:
+
+        fwd  610.9 -> 330.7 us   dx  704.3 -> 397.2 us
+
+    In an isolated single-GPU benchmark the same calls read 391 / 414 us against
+    444 / 446 us for DeepGEMM's own sm100 bf16 kernel and 625 / 713 us for the
+    Triton kernels below.
+
+    Numerics: this hands the accumulation to another library, so bit-exactness
+    is a per-shape measurement and not a property of the change. See
+    tests/single_card_tests/custom_ops/test_grouped_matmul_deep_gemm.py, which
+    records what was measured on the shapes it covers rather than asserting an
+    equality that need not hold. That is why the caller has to opt in.
+    """
+    einsum = _dg_einsum()
+    if einsum is None or not _dg_weight_ok(w):
+        return False
+    if any(t.dtype != paddle.bfloat16 for t in (a, w, d)):
+        return False  # einsum.hpp asserts bf16 on all three; fail closed
+    av = _dg_batched(a, m, g, k_a)
+    dv = _dg_batched(d, m, g, k_d)
+    if av is None or dv is None:
+        return False
+    einsum(_DG_EXPR[which], av, w, dv, None, True)
+    return True
+
+
+# --------------------------------------------------------------------------
+# Triton meta parameters
+#
+# None of the three kernels carries an @triton.autotune and no call site ever
+# overrode the signature defaults, so every launch ran 128x128x64 with Triton's
+# default 4 warps / 3 stages. Swept on B30Z (sm_103) at G=8 M=32768 R=768
+# D=1536 bf16 (cc_workspace/simulate_mfu/opt/gmm), isolated single GPU:
+#
+#   fwd  625.0 -> 538.1 us   (x1.16)   256x256x64 / 8 warps / 3 stages
+#   dx   712.8 -> 585.4 us   (x1.22)   256x256x64 / 8 warps / 3 stages
+#   dw   590.8 -> 410.9 us   (x1.44)   256x256x32 / 8 warps / 4 stages
+#
+# dw in real 8-card training: 602.0 -> 402.5 us, x1.496, spread across the 8
+# devices 3.0% -> 4.4%. All configurations bit-identical to the shipped one,
+# 0 register spills. On Blackwell the 256x256 f32 accumulator lives in tensor
+# memory rather than in registers, which is why the wider tile costs no spills;
+# for dw the tuned tile also drops the grid from 8x72 CTAs of 128 threads to
+# 8x18 of 256, i.e. 144 CTAs = one wave on 148 SMs with no tail.
+#
+# fwd/dx only reach this when the DeepGEMM path above was not requested or is
+# unavailable (fp16 operands, no paddlefleet_ops, or a layout DeepGEMM cannot
+# describe); dw always does, since bf16 DeepGEMM has no expression for it.
+# Unconditional: the sweep found every configuration bit-identical to the
+# shipped one, so there is nothing to gate.
+_TUNED = {
+    "fwd": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "num_warps": 8,
+        "num_stages": 3,
+    },
+    "dx": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "num_warps": 8,
+        "num_stages": 3,
+    },
+    "dw": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 32,
+        "num_warps": 8,
+        "num_stages": 4,
+    },
+}
+
+
+def _tuned(which, dim_m, dim_n):
+    """The tuned meta params, or {} to keep the shipped 128x128x64 defaults.
+
+    Only applied when both tiled dimensions are whole multiples of the tile.
+    The kernels mask correctly for any size, but the sweep covers exactly one
+    shape, and on a smaller R or D a 256-wide tile would compute mostly masked
+    lanes -- so any shape that is not an exact fit keeps today's behaviour
+    rather than an extrapolated guess.
+    """
+    cfg = _TUNED[which]
+    if dim_m % cfg["BLOCK_M"] or dim_n % cfg["BLOCK_N"]:
+        return {}
+    return cfg
 
 
 @enable_compat_on_triton_kernel
@@ -346,6 +542,7 @@ def _launch_grouped_dw(
         dw.stride()[1],
         dw.stride()[2],
         tl.bfloat16 if dy_3d.dtype == paddle.bfloat16 else tl.float16,
+        **_tuned("dw", R, D),
     )
     return dw
 
@@ -363,7 +560,9 @@ class GroupedMatmulTriton(paddle.autograd.PyLayer):
     """
 
     @staticmethod
-    def forward(ctx, x, w, dw_accumulator=None, group_shape=None):
+    def forward(
+        ctx, x, w, dw_accumulator=None, group_shape=None, use_deep_gemm=False
+    ):
         # PyLayer.forward runs with grad tracking off, so a tensor created here
         # comes out with stop_gradient=True. Read the caller's intent from the
         # inputs *before* any reshape, or w_needs_grad below silently turns
@@ -408,24 +607,26 @@ class GroupedMatmulTriton(paddle.autograd.PyLayer):
         #   stride_xg = D (= x_3d.stride()[1]), stride_xm = G*D (= x_3d.stride()[0]), stride_xk = 1
         # out is [M, G, R] with strides: (G*R, R, 1)
         #   stride_og = R (= out.stride()[1]), stride_om = G*R (= out.stride()[0]), stride_on = 1
-        grouped_matmul_fwd_kernel[grid](
-            x_3d,
-            w,
-            out,
-            M,
-            R,
-            D,
-            stride_xg,  # stride_xg: step between groups
-            stride_xm,  # stride_xm: step between rows (M dim)
-            stride_xk,  # stride_xk: step between cols (D dim)
-            w.stride()[0],
-            w.stride()[1],
-            w.stride()[2],
-            out.stride()[1],  # stride_og: step between groups
-            out.stride()[0],  # stride_om: step between rows (M dim)
-            out.stride()[2],  # stride_on: step between cols (R dim)
-            tl.bfloat16 if x.dtype == paddle.bfloat16 else tl.float16,
-        )
+        if not (use_deep_gemm and _dg_run("fwd", x_3d, w, out, M, G, D, R)):
+            grouped_matmul_fwd_kernel[grid](
+                x_3d,
+                w,
+                out,
+                M,
+                R,
+                D,
+                stride_xg,  # stride_xg: step between groups
+                stride_xm,  # stride_xm: step between rows (M dim)
+                stride_xk,  # stride_xk: step between cols (D dim)
+                w.stride()[0],
+                w.stride()[1],
+                w.stride()[2],
+                out.stride()[1],  # stride_og: step between groups
+                out.stride()[0],  # stride_om: step between rows (M dim)
+                out.stride()[2],  # stride_on: step between cols (R dim)
+                tl.bfloat16 if x.dtype == paddle.bfloat16 else tl.float16,
+                **_tuned("fwd", M, R),
+            )
 
         ctx.save_for_backward(x_3d, w)
         ctx.x_strides = x_strides
@@ -440,6 +641,9 @@ class GroupedMatmulTriton(paddle.autograd.PyLayer):
         ctx.x_needs_grad = not x.stop_gradient
         ctx.w_needs_grad = w_needs_grad
         ctx.dw_accumulator = dw_accumulator
+        # dx has to make the same choice as the forward, and backward has no
+        # access to the caller's config.
+        ctx.use_deep_gemm = use_deep_gemm
 
         # out is already [M, G, R] -> reshape to [..., G, R]
         out = out.reshape([*orig_shape[:-1], R])
@@ -472,24 +676,28 @@ class GroupedMatmulTriton(paddle.autograd.PyLayer):
                 triton.cdiv(M, META["BLOCK_M"])
                 * triton.cdiv(D, META["BLOCK_N"]),
             )
-            grouped_matmul_dx_kernel[grid_dx](
-                dy_3d,
-                w,
-                dx,
-                M,
-                D,  # N = D (output cols)
-                R,  # K = R (reduction)
-                stride_dyg,  # stride_dyg
-                stride_dym,  # stride_dym
-                stride_dyk,  # stride_dyk
-                w.stride()[0],
-                w.stride()[1],
-                w.stride()[2],
-                dx.stride()[1],  # stride_dxg
-                dx.stride()[0],  # stride_dxm
-                dx.stride()[2],  # stride_dxn
-                tl.bfloat16 if dy.dtype == paddle.bfloat16 else tl.float16,
-            )
+            if not (
+                ctx.use_deep_gemm and _dg_run("dx", dy_3d, w, dx, M, G, R, D)
+            ):
+                grouped_matmul_dx_kernel[grid_dx](
+                    dy_3d,
+                    w,
+                    dx,
+                    M,
+                    D,  # N = D (output cols)
+                    R,  # K = R (reduction)
+                    stride_dyg,  # stride_dyg
+                    stride_dym,  # stride_dym
+                    stride_dyk,  # stride_dyk
+                    w.stride()[0],
+                    w.stride()[1],
+                    w.stride()[2],
+                    dx.stride()[1],  # stride_dxg
+                    dx.stride()[0],  # stride_dxm
+                    dx.stride()[2],  # stride_dxn
+                    tl.bfloat16 if dy.dtype == paddle.bfloat16 else tl.float16,
+                    **_tuned("dx", M, D),
+                )
             # dx is already [M, G, D] -> reshape to [..., G, D]
             dx = dx.reshape(orig_shape)
 
@@ -521,7 +729,9 @@ class GroupedMatmulTriton(paddle.autograd.PyLayer):
         return dx, dw
 
 
-def fused_grouped_matmul(x, w, dw_accumulator=None, group_shape=None):
+def fused_grouped_matmul(
+    x, w, dw_accumulator=None, group_shape=None, use_deep_gemm=False
+):
     """Fused grouped matmul replacing paddle.einsum("...gd,grd->...gr", x, w).
 
     Args:
@@ -533,6 +743,13 @@ def fused_grouped_matmul(x, w, dw_accumulator=None, group_shape=None):
             returned to autograd -- the accumulator owns when it runs and
             where it lands (see dw_overlap.deferred_grouped_dw_accumulator).
             Ignored on the einsum fallback path.
+
+        use_deep_gemm: route the forward and dx GEMMs through DeepGEMM's bf16
+            einsum when the operand layout allows it (``_dg_run``), instead of
+            the Triton kernels. Off by default because it substitutes another
+            library's accumulation; dw is unaffected either way, since bf16
+            DeepGEMM has no expression for it. Callers pass
+            ``config.grouped_matmul_deep_gemm``.
 
     Returns:
         Output tensor [..., G, R]
@@ -572,4 +789,6 @@ def fused_grouped_matmul(x, w, dw_accumulator=None, group_shape=None):
             x,
             w.reshape(w_view_shape) if group_shape is not None else w,
         )
-    return GroupedMatmulTriton.apply(x, w, dw_accumulator, group_shape)
+    return GroupedMatmulTriton.apply(
+        x, w, dw_accumulator, group_shape, use_deep_gemm
+    )
