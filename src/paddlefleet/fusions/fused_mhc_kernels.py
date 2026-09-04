@@ -123,11 +123,18 @@ if _CUTILE_AVAILABLE:
     # Not a ``@ct.kernel(occupancy=...)`` argument: the best value is
     # compile-dependent, as the ``_ct_hpb_fwd`` pair below shows, where the same
     # hint is a win on one compile and a 2.5x loss on another.
-    _ct_sinkhorn_fwd_kernel_occ6 = _ct_sinkhorn_fwd_kernel.replace_hints(
-        occupancy=6
+    # The ``pragma: no cover`` here and on the four lines below is about the
+    # CI environment, not about being untested: everything in this module sits
+    # under ``if _CUTILE_AVAILABLE:`` and no workflow installs ``cuda.tile``,
+    # so the guard is False there and no line under it can ever be reached.
+    # What exercises these lines is
+    # ``tests/single_card_tests/custom_ops/test_fused_mhc_fwd_launch.py``,
+    # which needs a GPU.
+    _ct_sinkhorn_fwd_kernel_occ6 = (  # pragma: no cover
+        _ct_sinkhorn_fwd_kernel.replace_hints(occupancy=6)
     )
     # Widest HC for which the hint was measured bit-identical.
-    _CT_SINKHORN_OCC6_MAX_HC = 4
+    _CT_SINKHORN_OCC6_MAX_HC = 4  # pragma: no cover
 
     @ct.kernel
     def _ct_sinkhorn_bwd_kernel(
@@ -838,7 +845,9 @@ if _CUTILE_AVAILABLE:
     # ``@ct.kernel(occupancy=...)`` argument on purpose: the hint is a 1.89x
     # win on the fused compile and a 2.5x *loss* on the un-fused one, so the
     # un-fused path has to keep the default codegen.
-    _ct_hpb_fwd_kernel_occ8 = _ct_hpb_fwd_kernel.replace_hints(occupancy=8)
+    _ct_hpb_fwd_kernel_occ8 = (  # pragma: no cover
+        _ct_hpb_fwd_kernel.replace_hints(occupancy=8)
+    )
 
     @ct.kernel
     def _ct_hpb_fwd_bias_kernel(
@@ -1138,7 +1147,7 @@ if _CUTILE_AVAILABLE:
         # grid is one block per token so that needs a deterministic cross-block
         # reduction -- worth revisiting only for a bias-carrying config.
         fuse_cast = fuse_cast and bias is None
-        fwd_kernel = _ct_hpb_fwd_kernel
+        fwd_kernel = _ct_hpb_fwd_kernel  # pragma: no cover
         # Tile shape and occupancy for the fused path, measured on B30Z
         # (sm_103a, 148 SM; a plain bf16 copy of the same 1.21 GB reaches
         # 6.30 TB/s), sb=32768 n=4 C=2048, median of 100 timed launches:
@@ -1165,7 +1174,7 @@ if _CUTILE_AVAILABLE:
         # ``bias is None`` veto: the bias path launches
         # ``_ct_hpb_fwd_bias_kernel``, a third compile with no occupancy
         # measurement of its own.
-        if fuse_cast:
+        if fuse_cast:  # pragma: no cover
             TILE_C = math.gcd(C, 1024)
             fwd_kernel = _ct_hpb_fwd_kernel_occ8
         out_dtype = original_residual.dtype if fuse_cast else h_res.dtype
