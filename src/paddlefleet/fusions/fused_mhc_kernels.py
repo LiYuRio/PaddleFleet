@@ -106,8 +106,9 @@ if _CUTILE_AVAILABLE:
     # Occupancy hint, 2.67x on the shape this runs at (N_batch=8192, HC=4,
     # 5 iterations): 53.2 -> 19.9 us, registers 65 -> 40, local memory still 0.
     #
-    # Bit-identical at HC <= 4 and only there. Measured against the un-hinted
-    # kernel on the same inputs (fp32):
+    # Only used at HC <= 4, because that is the only range where it is
+    # bit-identical. Measured against the un-hinted kernel on the same inputs
+    # (fp32):
     #   HC=2, HC=4   0 differing elements
     #   HC=8         53% of elements differ, max relative 6.0e-07
     #   HC=16        55% of elements differ, max relative 5.7e-07
@@ -115,9 +116,9 @@ if _CUTILE_AVAILABLE:
     # hint caps registers, and from HC=8 the (TILE_SIZE, HC, HC) tile is large
     # enough that capping them makes cuTile schedule the two ``ct.sum``
     # reductions differently, which reassociates them. The error stays at fp32
-    # ULP scale, but it is a reassociation, not an identity. Every config in
-    # this repo sets ``hc_mult: 4``, so the shipped path is the bit-identical
-    # one; a wider mHC would need its own accuracy check.
+    # ULP scale, but it is a reassociation, not an identity, and
+    # ``num_residual_streams`` is not capped at 4 -- so the launcher picks the
+    # kernel by width instead of assuming the narrow case.
     #
     # Not a ``@ct.kernel(occupancy=...)`` argument: the best value is
     # compile-dependent, as the ``_ct_hpb_fwd`` pair below shows, where the same
@@ -125,6 +126,8 @@ if _CUTILE_AVAILABLE:
     _ct_sinkhorn_fwd_kernel_occ6 = _ct_sinkhorn_fwd_kernel.replace_hints(
         occupancy=6
     )
+    # Widest HC for which the hint was measured bit-identical.
+    _CT_SINKHORN_OCC6_MAX_HC = 4
 
     @ct.kernel
     def _ct_sinkhorn_bwd_kernel(
@@ -204,7 +207,11 @@ if _CUTILE_AVAILABLE:
         ct.launch(
             _get_cuda_stream(),
             (math.ceil(N_batch / TILE_SIZE), 1, 1),
-            _ct_sinkhorn_fwd_kernel_occ6,
+            (
+                _ct_sinkhorn_fwd_kernel_occ6
+                if hc <= _CT_SINKHORN_OCC6_MAX_HC
+                else _ct_sinkhorn_fwd_kernel
+            ),
             (
                 input_logits.reshape([N_batch, hc, hc]),
                 out,

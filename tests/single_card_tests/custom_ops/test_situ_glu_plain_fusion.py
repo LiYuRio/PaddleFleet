@@ -185,6 +185,22 @@ class TestSituGLUPlainFusionSwitch(unittest.TestCase):
         )
         self.assertTrue(_bit_exact(actual, expected))
 
+    def test_falls_back_on_a_dtype_the_kernel_cannot_take(self):
+        # The op chain casts to fp32 first, so float64 works there. The kernel
+        # only widens from fp16/bf16/fp32 and would raise out of its own
+        # ``_geom`` guard, so the flag must decline rather than turn a working
+        # call into a TypeError.
+        x = paddle.randn([8, 32], dtype="float64")
+        expected = situ_glu(x, beta=BETA, linear_beta=LINEAR_BETA)
+        actual = situ_glu(
+            x,
+            beta=BETA,
+            linear_beta=LINEAR_BETA,
+            situ_glu_plain_fusion=True,
+        )
+        self.assertEqual(actual.dtype, expected.dtype)
+        self.assertTrue(_bit_exact(actual, expected))
+
 
 class TestSituGLUPlainFusionNumerics(unittest.TestCase):
     def setUp(self):

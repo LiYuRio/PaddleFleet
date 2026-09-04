@@ -76,7 +76,16 @@ def situ_glu(
         )
 
     input_dtype = x.dtype
-    if situ_glu_plain_fusion and x.place.is_gpu_place() and x.is_contiguous():
+    if (
+        situ_glu_plain_fusion
+        and x.place.is_gpu_place()
+        and x.is_contiguous()
+        # The kernel widens in-register from these three; the op chain below
+        # casts to fp32 first and so also accepts e.g. float64. Checking the
+        # dtype here keeps that case a fallback rather than a TypeError out of
+        # the kernel's own ``_geom`` guard.
+        and x.dtype in (paddle.float16, paddle.bfloat16, paddle.float32)
+    ):
         from paddlefleet.triton_ops.utils import is_triton_available
 
         if is_triton_available():

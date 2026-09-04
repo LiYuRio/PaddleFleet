@@ -83,8 +83,11 @@ def _hpb_fwd_legacy(h_res, original_residual, h_post, x):
     return out.reshape([s, b, n, C])
 
 
-def _sinkhorn_fwd_legacy(input_logits, num_iterations, eps):
-    """``_cutile_sinkhorn_fwd`` with the un-hinted kernel object."""
+def _sinkhorn_fwd_legacy(input_logits, num_iterations, eps, kernel=None):
+    """``_cutile_sinkhorn_fwd`` with an explicit kernel object.
+
+    Defaults to the un-hinted one, i.e. the pre-change configuration.
+    """
     original_shape = input_logits.shape
     hc = original_shape[-1]
     n_batch = input_logits.size // (hc * hc)
@@ -94,7 +97,7 @@ def _sinkhorn_fwd_legacy(input_logits, num_iterations, eps):
     M.ct.launch(
         M._get_cuda_stream(),
         (math.ceil(n_batch / tile), 1, 1),
-        M._ct_sinkhorn_fwd_kernel,
+        kernel if kernel is not None else M._ct_sinkhorn_fwd_kernel,
         (
             input_logits.reshape([n_batch, hc, hc]),
             out,
@@ -169,13 +172,16 @@ class TestHPostBDAForwardLaunch(unittest.TestCase):
 class TestSinkhornForwardLaunch(unittest.TestCase):
     # (N_batch, HC, iters). HC is the axis that matters: the occupancy hint caps
     # registers, and from HC=8 that makes cuTile schedule the two ``ct.sum``
-    # reductions differently. Every config in this repo sets ``hc_mult: 4``.
-    BIT_EXACT = ((8192, 4, 5), (128, 4, 1), (8192, 2, 5))
-    REASSOCIATED = ((192, 8, 3), (8192, 8, 5), (64, 16, 3))
+    # reductions differently. The launcher therefore only uses the hinted kernel
+    # at HC <= _CT_SINKHORN_OCC6_MAX_HC, so the result is bit-identical at every
+    # width -- narrow ones because the hint does not change the arithmetic there,
+    # wide ones because they do not get the hint at all.
+    HINTED = ((8192, 4, 5), (128, 4, 1), (8192, 2, 5))
+    NOT_HINTED = ((192, 8, 3), (8192, 8, 5), (64, 16, 3))
 
     @_requires_cutile
-    def test_occupancy_hint_is_bit_exact_at_shipped_widths(self):
-        for n_batch, hc, iters in self.BIT_EXACT:
+    def test_is_bit_exact_at_every_width(self):
+        for n_batch, hc, iters in self.HINTED + self.NOT_HINTED:
             with self.subTest(n_batch=n_batch, hc=hc, iters=iters):
                 paddle.seed(20260903)
                 logits = paddle.randn([n_batch, hc, hc], dtype="float32")
@@ -184,24 +190,33 @@ class TestSinkhornForwardLaunch(unittest.TestCase):
                 self.assertTrue(_bit_equal(out, out_ref), "out differs")
 
     @_requires_cutile
-    def test_occupancy_hint_reassociates_above_hc_4(self):
-        # Documents the boundary rather than asserting the hint is harmless
-        # everywhere: at HC >= 8 the results differ, and what is checked is that
-        # the difference stays at fp32 ULP scale. If a config ever raises
-        # hc_mult past 4, this stops being a free change.
-        for n_batch, hc, iters in self.REASSOCIATED:
-            with self.subTest(n_batch=n_batch, hc=hc, iters=iters):
-                paddle.seed(20260903)
-                logits = paddle.randn([n_batch, hc, hc], dtype="float32")
-                out_ref = _sinkhorn_fwd_legacy(logits, iters, 1e-8)
-                out = fused_sinkhorn(logits, iters, 1e-8)
+    def test_wide_mhc_declines_the_hint(self):
+        # Guards the reason the test above passes for the wide cases. Without
+        # this, a future change that drops the width gate would still look green
+        # on `test_is_bit_exact_at_every_width` only by accident.
+        self.assertEqual(M._CT_SINKHORN_OCC6_MAX_HC, 4)
+        for _n_batch, hc, _iters in self.NOT_HINTED:
+            self.assertGreater(
+                hc,
+                M._CT_SINKHORN_OCC6_MAX_HC,
+                "NOT_HINTED case is inside the hinted range",
+            )
 
-                self.assertFalse(
-                    _bit_equal(out, out_ref),
-                    f"HC={hc} is bit-exact now; tighten this test",
-                )
-                rel = (out - out_ref).abs() / out_ref.abs().clip(min=1e-30)
-                self.assertLess(float(rel.max()), 1e-6)
+    @_requires_cutile
+    def test_the_hint_really_does_reassociate_above_the_gate(self):
+        # The gate is not cosmetic: launched directly, the hinted kernel differs
+        # from the un-hinted one at HC=8, at fp32 ULP scale. If this ever stops
+        # being true the gate can be dropped -- so assert it rather than leaving
+        # it as a comment.
+        paddle.seed(20260903)
+        logits = paddle.randn([8192, 8, 8], dtype="float32")
+        plain = _sinkhorn_fwd_legacy(logits, 5, 1e-8)
+        hinted = _sinkhorn_fwd_legacy(
+            logits, 5, 1e-8, kernel=M._ct_sinkhorn_fwd_kernel_occ6
+        )
+        self.assertFalse(_bit_equal(hinted, plain))
+        rel = (hinted - plain).abs() / plain.abs().clip(min=1e-30)
+        self.assertLess(float(rel.max()), 1e-6)
 
 
 if __name__ == "__main__":
