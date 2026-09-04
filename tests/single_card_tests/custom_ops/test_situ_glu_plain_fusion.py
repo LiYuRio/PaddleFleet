@@ -81,6 +81,15 @@ def _bit_exact(actual, expected):
     )
 
 
+# The guard and switch tests below run on CPU on purpose -- one of them asserts
+# that the Triton entries *reject* CPU tensors -- so the skip is applied per
+# class and per test rather than to the module.
+_requires_gpu = unittest.skipIf(
+    not paddle.is_compiled_with_cuda(),
+    "the fused situ-GLU path is a Triton GPU kernel",
+)
+
+
 class TestSituGLUPlainFusionGuards(unittest.TestCase):
     def test_triton_entries_reject_cpu_inputs(self):
         cpu_place = paddle.CPUPlace()
@@ -171,6 +180,8 @@ class TestSituGLUPlainFusionSwitch(unittest.TestCase):
 
         self.assertTrue(_bit_exact(actual, expected))
 
+    # bfloat16 only, unlike the rest of this class.
+    @_requires_gpu
     def test_falls_back_on_non_contiguous_input(self):
         base = paddle.randn([8, 32], dtype="bfloat16")
         x = base[:, ::2]
@@ -202,6 +213,7 @@ class TestSituGLUPlainFusionSwitch(unittest.TestCase):
         self.assertTrue(_bit_exact(actual, expected))
 
 
+@_requires_gpu
 class TestSituGLUPlainFusionNumerics(unittest.TestCase):
     def setUp(self):
         paddle.seed(20260903)
@@ -275,6 +287,7 @@ class TestSituGLUPlainFusionNumerics(unittest.TestCase):
         self.assertTrue(out.stop_gradient)
 
 
+@_requires_gpu
 class TestSituGLUPlainFusionReachesTheMLP(unittest.TestCase):
     """The flag is only useful if it survives the trip from config to kernel."""
 

@@ -38,7 +38,8 @@ from paddlefleet.fusions.fused_mhc_kernels import (
 )
 
 _requires_cutile = unittest.skipUnless(
-    is_cutile_available(), "cuTile not available"
+    is_cutile_available() and paddle.is_compiled_with_cuda(),
+    "cuTile fused kernels need a GPU build with cuda.tile",
 )
 
 

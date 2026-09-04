@@ -110,6 +110,11 @@ CASES = [
 ]
 
 
+@unittest.skipIf(
+    not paddle.is_compiled_with_cuda()
+    or paddle.device.cuda.get_device_capability()[0] < 8,
+    "fused_q_rms_norm requires GPU with SM80+ (bf16)",
+)
 class TestQRMSNormUnroll(unittest.TestCase):
     def _inputs(self, shape, seed):
         paddle.seed(seed)
