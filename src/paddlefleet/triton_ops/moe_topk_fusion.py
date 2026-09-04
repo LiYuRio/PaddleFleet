@@ -650,8 +650,15 @@ def _routing_map_fwd_bitmap_kernel(
         tl.where(hit, (1 << tl.where(hit, rel, 0)), 0), 1, _bitwise_or
     )
 
-    # Expand the word back to one fp32 per expert.
-    routing_block = ((bits[:, None] >> lane[None, :]) & 1).to(tl.float32)
+    # Expand the word back to one fp32 per expert. A row that hit relative
+    # index 31 has the top bit set, so bitcast to uint32 first and let the
+    # shift be a logical one; `& 1` would keep only bit 0 either way, but an
+    # unsigned word leaves nothing to reason about. Relative index 31 is
+    # covered by test_routing_map_bitmap.py, which checks those rows against
+    # both the kernel this replaces and an independent one-hot scatter.
+    words = bits.to(tl.uint32, bitcast=True)
+    lanes = lane.to(tl.uint32, bitcast=True)
+    routing_block = ((words[:, None] >> lanes[None, :]) & 1).to(tl.float32)
     routing_block = tl.where(is_valid[:, None], routing_block, 0.0)
 
     tl.store(

@@ -149,6 +149,60 @@ class TestRoutingMapBitmap(unittest.TestCase):
         topk_indices[1::5, :] = -1
         self._assert_agrees("sentinel -1", gate_probs, topk_indices)
 
+    def test_matches_reference_when_the_words_top_bit_is_set(self):
+        # `bits` is int32, so a row that hits relative index 31 sets the sign
+        # bit and `bits >> lane` is an arithmetic shift. Safe, because the
+        # expansion masks with `& 1` and sign extension only fills the bits
+        # shifted in at the top -- but nothing else in this file forces
+        # relative index 31 to be hit, so it is pinned here.
+        cases = {
+            # n_experts == 32: one tile, so relative index 31 is expert 31 and
+            # `bits` is INT_MIN when that is the only pick.
+            "only expert 31": (128, 32, [[31]] * 128),
+            "experts 31 and 0": (128, 32, [[31, 0]] * 128),
+            "experts 31 and 30": (128, 32, [[31, 30]] * 128),
+            # One row per bit position, so bit 31 is compared against 0..30 in
+            # the same launch.
+            "one row per expert": (32, 32, [[e] for e in range(32)]),
+            # Relative index 31 in a tile other than the first.
+            "expert 63": (64, 64, [[63]] * 64),
+            "experts 31 and 63": (64, 64, [[31, 63]] * 64),
+            # A tile whose lane 31 is the last fully populated expert.
+            "n_experts=33": (64, 33, [[31, 32]] * 64),
+            # `bits == -1`: every bit of the word set.
+            "all 32 bits": (64, 32, [list(range(32))] * 64),
+        }
+        for name, (seq_len, n_experts, rows) in cases.items():
+            with self.subTest(case=name):
+                topk_indices = paddle.to_tensor(rows, dtype="int64")
+                gate_probs = paddle.rand([seq_len, n_experts], dtype="float32")
+                self._assert_agrees(name, gate_probs, topk_indices)
+
+                # Also against a one-hot scatter, so this does not rest on the
+                # reference kernel being right about the top bit either.
+                experts_axis = paddle.arange(n_experts, dtype="int64")
+                expected = (
+                    (topk_indices.unsqueeze(-1) == experts_axis)
+                    .any(axis=1)
+                    .astype("float32")
+                )
+                routing_map, _, dispatch_mask = routing_map_fusion_forward(
+                    gate_probs, topk_indices
+                )
+                self.assertTrue(
+                    bool(paddle.equal_all(routing_map, expected)),
+                    f"{name}: routing_map differs from a one-hot scatter",
+                )
+                self.assertTrue(
+                    bool(
+                        paddle.equal_all(
+                            dispatch_mask,
+                            expected.sum(axis=0).astype("int64"),
+                        )
+                    ),
+                    f"{name}: dispatch_mask is not the scatter's column sum",
+                )
+
     def test_matches_reference_with_masks(self):
         seq_len, n_experts, moe_k = 300, 130, 10
         gate_probs, topk_indices = _make_inputs(
