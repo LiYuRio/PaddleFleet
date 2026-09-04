@@ -96,6 +96,10 @@ def _make_inputs(seq_len, n_experts, moe_k, seed):
     return gate_probs, topk_indices
 
 
+@unittest.skipIf(
+    not paddle.is_compiled_with_cuda(),
+    "the routing-map kernels are Triton GPU kernels",
+)
 class TestRoutingMapBitmap(unittest.TestCase):
     def _assert_agrees(self, msg, *args, **kwargs):
         expected = _reference_forward(*args, **kwargs)
