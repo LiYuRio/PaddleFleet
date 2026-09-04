@@ -2648,6 +2648,7 @@ class Gemma4TransformerLayer(TransformerLayer):
         attention_bias: Tensor | None = None,
         packed_seq_params=None,
         input_ids: Tensor | None = None,
+        origin_input_ids: Tensor | None = None,
         **kwargs,
     ):
         # === Attention block ===
@@ -2681,7 +2682,10 @@ class Gemma4TransformerLayer(TransformerLayer):
 
         if isinstance(self.mlp, MoELayer):
             hidden_states, _ = self.mlp(
-                hidden_states, input_ids=input_ids, residual=residual
+                hidden_states,
+                input_ids=input_ids,
+                residual=residual,
+                origin_input_ids=origin_input_ids,
             )
         else:
             hidden_states = self.mlp(hidden_states)
