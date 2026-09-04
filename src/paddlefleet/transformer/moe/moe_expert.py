@@ -219,6 +219,9 @@ class GroupedMLPExpert(FleetLayer):
                         x,
                         beta=self.config.activation_situ_beta,
                         linear_beta=self.config.activation_situ_linear_beta,
+                        situ_glu_plain_fusion=getattr(
+                            self.config, "situ_glu_plain_fusion", False
+                        ),
                     )
 
             else:
