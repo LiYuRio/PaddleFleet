@@ -339,6 +339,19 @@ class TransformerConfig(ModelParallelConfig):
     SiTU-GLU as separate ops; the fused kernel also falls back to those ops
     when Triton is unavailable."""
 
+    situ_glu_plain_fusion: bool = False
+    """Opt into the fused Triton SiTU-GLU kernel on the call sites that have no
+    router scaling: the dense MLP (``StandardMLPSharedExpert`` and the
+    ``first_k_dense_replace`` layer) and the non-FP8 GroupedMLP experts. This is
+    a different kernel from the one ``situ_glu_fusion`` selects -- that one also
+    fuses the per-token router scale and only serves FusionMoe -- so the two
+    flags are independent. Off by default, which runs SiTU-GLU as 13 separate
+    fp32 ops; the fused kernel also falls back to those ops when Triton is
+    unavailable or the input is not a contiguous GPU tensor. The forward is
+    bit-exact against the op chain; the backward is not (0.07% of gradient
+    elements differ, all near zero, in the direction of being more accurate --
+    see ``triton_ops/situ_glu_plain.py``)."""
+
     use_bias: bool = False
     """Include a bias term in all linear layers (QKV projections and Output projections, after core attention, and two in
     MLP layer)."""
@@ -1841,6 +1854,37 @@ class TransformerConfig(ModelParallelConfig):
 
     routing_map_fusion: bool = False
     """If True, use Triton fused routing map kernel for MoE routing."""
+
+    grouped_matmul_deep_gemm: bool = False
+    """Route ``fused_grouped_matmul``'s forward and dx GEMMs through DeepGEMM's
+    bf16 einsum instead of the Triton kernels, wherever the operand layout lets
+    DeepGEMM describe the data. Off by default: unlike the tuned Triton meta
+    params, which are bit-identical and therefore always on, this substitutes
+    another library's accumulation, so it wants its own accuracy check before a
+    real run. Measured on B30Z at G=8 M=32768 R=768 D=1536 bf16 in 8-card
+    training: fwd 610.9 -> 330.7 us, dx 704.3 -> 397.2 us. dw is unaffected --
+    bf16 DeepGEMM has no expression for it and stays on Triton. Falls back to
+    Triton per call for fp16 operands, a missing ``paddlefleet_ops``, or any
+    layout DeepGEMM cannot describe, so enabling it is a request rather than a
+    guarantee."""
+
+    liger_ce_multimax_tuning: bool = False
+    """Use the tuned multimax cross-entropy kernel
+    (``liger_cross_entropy_multimax_tuned_kernel``) plus its own launch geometry
+    instead of ``liger_cross_entropy_multimax_kernel`` at the non-multimax
+    kernel's 2048-tile / 4-warp settings. Only affects the fused lm-head CE path
+    (``fused_linear_ce_loss_chunk > 0`` with multimax operands).
+
+    Measured on B30Z at BT=32768, V=201216, bf16, num_chunks=1: 25.13 -> 13.64 ms
+    per launch (x1.84) with param grads, 15.20 -> 12.16 ms (x1.25) when the
+    multimax parameters are frozen.
+
+    Off by default because it is *not* bit-identical, and the body and the launch
+    geometry cannot be separated: num_warps 4 -> 1 changes which lanes reduce the
+    eight param-grad sums, and the body replaces ``exp(..)/d`` with
+    ``exp(..)*inv_d`` and moves the one-hot correction out of the loop. The body
+    rewrite is what keeps the 1024-wide tile spill-free, so this flag selects
+    both together -- which is also why turning it off is an exact revert."""
 
     magic_init: bool = False
     """Use the magic initialization method."""

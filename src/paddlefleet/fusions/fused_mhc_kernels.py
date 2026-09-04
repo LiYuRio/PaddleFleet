@@ -103,6 +103,32 @@ if _CUTILE_AVAILABLE:
             tile=ct.reshape(M.astype(out.dtype), (TILE_SIZE, HC, HC)),
         )
 
+    # Occupancy hint, 2.67x on the shape this runs at (N_batch=8192, HC=4,
+    # 5 iterations): 53.2 -> 19.9 us, registers 65 -> 40, local memory still 0.
+    #
+    # Only used at HC <= 4, because that is the only range where it is
+    # bit-identical. Measured against the un-hinted kernel on the same inputs
+    # (fp32):
+    #   HC=2, HC=4   0 differing elements
+    #   HC=8         53% of elements differ, max relative 6.0e-07
+    #   HC=16        55% of elements differ, max relative 5.7e-07
+    # "An occupancy hint cannot change arithmetic" is *not* true for cuTile: the
+    # hint caps registers, and from HC=8 the (TILE_SIZE, HC, HC) tile is large
+    # enough that capping them makes cuTile schedule the two ``ct.sum``
+    # reductions differently, which reassociates them. The error stays at fp32
+    # ULP scale, but it is a reassociation, not an identity, and
+    # ``num_residual_streams`` is not capped at 4 -- so the launcher picks the
+    # kernel by width instead of assuming the narrow case.
+    #
+    # Not a ``@ct.kernel(occupancy=...)`` argument: the best value is
+    # compile-dependent, as the ``_ct_hpb_fwd`` pair below shows, where the same
+    # hint is a win on one compile and a 2.5x loss on another.
+    _ct_sinkhorn_fwd_kernel_occ6 = _ct_sinkhorn_fwd_kernel.replace_hints(
+        occupancy=6
+    )
+    # Widest HC for which the hint was measured bit-identical.
+    _CT_SINKHORN_OCC6_MAX_HC = 4
+
     @ct.kernel
     def _ct_sinkhorn_bwd_kernel(
         grad_out,
@@ -181,7 +207,11 @@ if _CUTILE_AVAILABLE:
         ct.launch(
             _get_cuda_stream(),
             (math.ceil(N_batch / TILE_SIZE), 1, 1),
-            _ct_sinkhorn_fwd_kernel,
+            (
+                _ct_sinkhorn_fwd_kernel_occ6
+                if hc <= _CT_SINKHORN_OCC6_MAX_HC
+                else _ct_sinkhorn_fwd_kernel
+            ),
             (
                 input_logits.reshape([N_batch, hc, hc]),
                 out,
@@ -802,6 +832,14 @@ if _CUTILE_AVAILABLE:
                 out, index=(pid, 0, ct_idx), tile=out_tile.astype(out.dtype)
             )
 
+    # The same kernel with an occupancy hint, used by the fused
+    # (``fuse_cast=True``) forward path only -- see ``_cutile_h_post_bda_fwd``
+    # for the numbers. Kept as a second kernel object instead of a
+    # ``@ct.kernel(occupancy=...)`` argument on purpose: the hint is a 1.89x
+    # win on the fused compile and a 2.5x *loss* on the un-fused one, so the
+    # un-fused path has to keep the default codegen.
+    _ct_hpb_fwd_kernel_occ8 = _ct_hpb_fwd_kernel.replace_hints(occupancy=8)
+
     @ct.kernel
     def _ct_hpb_fwd_bias_kernel(
         hr,
@@ -1074,16 +1112,6 @@ if _CUTILE_AVAILABLE:
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
-        # Optimized: use largest power-of-2 tile that divides C, up to 4096
-        # cuTile requires TILE_C to be a power of 2
-        TILE_C = (
-            math.gcd(C, 4096)
-            if C % 4096 == 0
-            else math.gcd(C, 2048)
-            if C % 2048 == 0
-            else math.gcd(C, 1024)
-        )
-        TILE_SIZE = math.gcd(sb, 1)
         # ``fuse_cast`` means the caller skipped the fp32 widening it would
         # otherwise have done, so the kernel widens in-register and the result
         # comes back in the residual dtype. This cannot be sniffed
@@ -1100,6 +1128,65 @@ if _CUTILE_AVAILABLE:
         # grid is one block per token so that needs a deterministic cross-block
         # reduction -- worth revisiting only for a bias-carrying config.
         fuse_cast = fuse_cast and bias is None
+        # cuTile requires TILE_C to be a power of 2.
+        #
+        # Tile shape and occupancy for the fused path, measured on B30Z
+        # (sm_103a, 148 SM; a plain bf16 copy of the same 1.21 GB reaches
+        # 6.30 TB/s), sb=32768 n=4 C=2048, median of 100 timed launches:
+        #
+        #   TILE_C=2048, no hint (what this used to do)  558.9 us  2.17 TB/s
+        #   TILE_C=1024, occupancy=8                     296.4 us  4.08 TB/s
+        #
+        # 1.89x. The lever is occupancy, not the tile shape: this kernel is
+        # pure streaming, but at 164 registers/thread only ~3 CTAs stay
+        # resident per SM, which is not enough in flight to cover DRAM
+        # latency -- it was running at 34% of copy bandwidth. occupancy=8
+        # caps registers at 64, and that *does* spill (80 B stack frame,
+        # 22 LDL + 20 STL in the SASS); it is still 1.89x faster, because
+        # ~40 local-memory instructions per CTA cost far less than the memory
+        # latency the extra concurrency hides. Verified bit-identical to the
+        # old configuration (0 differing elements out of 2.7e8) and faster at
+        # every shape tried: 1.61x at n=2, 1.40x at n=8, 1.69x at sb=8192,
+        # 2.58x at C=4096, 2.83x at C=1024. If a spill-free variant is ever
+        # needed, TILE_C=256 + occupancy=8 gives 426.0 us (1.31x) with
+        # STACK:0.
+        #
+        # None of this applies without fuse_cast: those operands arrive
+        # already fp32, that compile is already at 6.37 TB/s (379.9 us), and
+        # occupancy=8 would take it to 953.1 us. So it keeps the old settings.
+        # This has to sit *after* the ``bias is None`` veto above: the bias
+        # path launches ``_ct_hpb_fwd_bias_kernel``, a third compile that has
+        # no occupancy measurement of its own.
+        if fuse_cast:
+            TILE_C = math.gcd(C, 1024)
+            fwd_kernel = _ct_hpb_fwd_kernel_occ8
+        else:
+            # Largest power-of-2 tile that divides C, up to 4096.
+            TILE_C = (
+                math.gcd(C, 4096)
+                if C % 4096 == 0
+                else math.gcd(C, 2048)
+                if C % 2048 == 0
+                else math.gcd(C, 1024)
+            )
+            fwd_kernel = _ct_hpb_fwd_kernel
+        # One token per block. This used to read ``math.gcd(sb, 1)``, which
+        # is a no-op idiom -- gcd(x, 1) is 1 for every x -- so it looked
+        # tunable and never was. It is now measured rather than assumed: the
+        # kernel body is TILE_SIZE-agnostic (bit-identical output for
+        # TILE_SIZE in 1, 2, 4, 8), but every larger value is slower, because
+        # the (TILE_SIZE, N, TILE_C) tile is already register-bound at 1.
+        # Growing it either runs into the 255-register ceiling or makes cuTile
+        # stage through shared memory: at TILE_C=2048, TILE_SIZE=2 costs
+        # 744.8 us (0.75x) at 255 regs, and TILE_SIZE=4 with TILE_C=512 --
+        # same tile footprint as the shipped config -- costs 1424.3 us.
+        #
+        # WARNING: do not copy any of this into ``_cutile_h_post_bda_bwd``.
+        # ``_ct_hpb_bwd_kernel`` is pinned to TILE_SIZE=1 by construction: its
+        # reshapes to (1, N), (N, N) and (N, TILE_C) would fold different
+        # tokens together for TILE_SIZE > 1, and its grid is hardcoded to
+        # ``sb`` regardless of what TILE_SIZE says.
+        TILE_SIZE = 1
         out_dtype = original_residual.dtype if fuse_cast else h_res.dtype
         out = paddle.empty(shape=[sb, n, C], dtype=out_dtype)
         grid = (math.ceil(sb / TILE_SIZE),)
@@ -1124,7 +1211,7 @@ if _CUTILE_AVAILABLE:
             ct.launch(
                 _get_cuda_stream(),
                 grid,
-                _ct_hpb_fwd_kernel,
+                fwd_kernel,
                 (
                     h_res.reshape([sb, n, n]),
                     original_residual.reshape([sb, n, C]),

@@ -1211,12 +1211,15 @@ class DSv4HybridAttention(Attention):
             ]
             from paddlefleet.triton_ops import fused_grouped_matmul
 
+            use_dg = getattr(self.config, "grouped_matmul_deep_gemm", False)
             dw_acc = deferred_grouped_dw_accumulator(
                 self.config, "attn_o_group_proj", self.linear_o_group_proj
             )
             if dw_acc is None:
                 core_attn_out = fused_grouped_matmul(
-                    core_attn_out, self.linear_o_group_proj.reshape(group_shape)
+                    core_attn_out,
+                    self.linear_o_group_proj.reshape(group_shape),
+                    use_deep_gemm=use_dg,
                 )
             else:
                 # Hand in the leaf parameter, not a reshaped view: the deferred path
@@ -1227,6 +1230,7 @@ class DSv4HybridAttention(Attention):
                     self.linear_o_group_proj,
                     dw_accumulator=dw_acc,
                     group_shape=group_shape,
+                    use_deep_gemm=use_dg,
                 )
             core_attn_out = core_attn_out.reshape([b, sq, -1])
 
