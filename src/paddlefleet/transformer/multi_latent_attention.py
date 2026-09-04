@@ -2135,9 +2135,6 @@ class MLASelfAttention(MultiLatentAttention):
                                     self.qk_nope_head_dim,
                                 ]
                             ),
-                            use_deep_gemm=getattr(
-                                self.config, "grouped_matmul_deep_gemm", False
-                            ),
                         )
                     else:
                         w_k_b = self.kv_b_proj.weight.reshape(
