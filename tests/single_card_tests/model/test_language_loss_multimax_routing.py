@@ -150,9 +150,8 @@ class TestLanguageLossMultimaxRouting(unittest.TestCase):
         self.assertIsInstance(loss, paddle.Tensor)
 
     def test_5tuple_routes_with_multimax_args(self):
-        """5-tuple input: apply() must receive 11 positional args, with
-        multimax_ranges at index 8, multimax_ts at index 9, and the
-        liger_ce_multimax_tuning flag at index 10."""
+        """5-tuple input: apply() must receive 10 positional args, with
+        multimax_ranges at index 8 and multimax_ts at index 9."""
         hidden, weight, bias, labels, B, S = self._make_inputs()
         ranges = paddle.zeros([4], dtype="float32")
         ts = paddle.zeros([4], dtype="float32")
@@ -170,21 +169,13 @@ class TestLanguageLossMultimaxRouting(unittest.TestCase):
         forwarded = calls[0]
         self.assertEqual(
             len(forwarded),
-            11,
-            f"expected 11 args with multimax, got {len(forwarded)}",
+            10,
+            f"expected 10 args with multimax, got {len(forwarded)}",
         )
         # Identity by `is` to confirm exactly the same tensors are forwarded
         # (no implicit copy/cast in the routing layer).
         self.assertIs(forwarded[8], ranges, "multimax_ranges position wrong")
         self.assertIs(forwarded[9], ts, "multimax_ts position wrong")
-        # Index 10 rides with the multimax operands because it selects the tuned
-        # *multimax* CE kernel; it means nothing to the non-multimax kernel,
-        # which is why test_3tuple_routes_without_multimax_args still wants 8.
-        self.assertEqual(
-            forwarded[10],
-            getattr(stub.config, "liger_ce_multimax_tuning", False),
-            "liger_ce_multimax_tuning position wrong",
-        )
         self.assertEqual(
             forwarded[6],
             stub.config.fused_linear_ce_loss_chunk,
