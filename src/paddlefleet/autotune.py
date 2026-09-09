@@ -46,7 +46,8 @@ Two rules that the order of operations encodes
    than the winner (which sat at 25%), and a cleaner one (37 regs, 0 spill)
    lost by 4% to a dirtier one. Issue rate can even be inverted -- the faster
    variant issued *more*. Static numbers are used here only to bound the
-   candidate set and to detect a silently dropped hint.
+   candidate set -- an infeasible candidate is not offered at all, rather than
+   offered and then detected after the fact.
 
 Three entry points
 ------------------
@@ -257,10 +258,13 @@ def ctas_per_sm(regs: int, ntid: int, smem: int,
                 facts: dict | None = None) -> dict:
     """Resident CTAs per SM implied by a compiled kernel's resource usage.
 
-    Used to detect a hint that was accepted syntactically and then dropped:
-    cuTile's ``occupancy=k`` is silently ignored whenever
-    ``k * smem_per_block`` exceeds the shared memory an SM has, so a candidate
-    can look distinct and compile to the same thing.
+    Two uses, both of them bounding the candidate set before anything is
+    compiled. First, an occupancy hint is silently ignored by cuTile whenever
+    ``k * smem_per_block`` exceeds the shared memory an SM has, so such a
+    candidate would compile to the same code as the unhinted one and be timed
+    as though it were distinct -- it is simply not offered. Second, capping
+    registers only buys occupancy when registers, and not shared memory, are
+    what limits residency; ``by_reg`` and ``by_smem`` say which.
     """
     facts = machine_facts() if facts is None else facts
     out = {}
@@ -633,19 +637,18 @@ def tune(
     iters: int = MIN_ITERS,
     input_sets: int = 1,
     reseed=None,
-    hint_probe=None,
     key_extra=None,
 ) -> dict:
     """Return the launch configuration to use for one kernel at one shape.
 
     ``launch(cfg, outputs)`` performs exactly one launch; ``make_outputs()``
     returns freshly allocated output tensors. Both are only called by the
-    process that ends up scanning, and only on a cache miss. ``hint_probe(cfg)``
-    may return
-    ``{"requested": k, "blocks": m}`` for configurations that carry an
-    occupancy or CTA hint; a candidate whose hint did not survive compilation
-    is dropped with that recorded, because otherwise it is timed as if it were
-    a distinct configuration when it compiled to the same code.
+    process that ends up scanning, and only on a cache miss.
+
+    Candidates are expected to be feasible: a configuration the toolchain will
+    silently ignore compiles to the same code as another candidate and would be
+    timed as though it were distinct, so the caller keeps it out of the list
+    (see ``ctas_per_sm``) instead of the tuner detecting it afterwards.
 
     Never raises: every failure path returns ``factory``.
     """
@@ -727,7 +730,7 @@ def tune(
         try:
             record = _scan(name, factory, candidates, plain, key,
                            make_outputs, launch, warmup, iters,
-                           input_sets, reseed, hint_probe)
+                           input_sets, reseed)
         except Exception as exc:
             _warn(f"{name}: scan failed ({type(exc).__name__}: {exc}); "
                   f"using the factory configuration "
@@ -739,7 +742,7 @@ def tune(
 
 
 def _scan(name, factory, candidates, plain, key, make_outputs, launch,
-          warmup, iters, input_sets, reseed, hint_probe) -> dict:
+          warmup, iters, input_sets, reseed) -> dict:
     """Gate on bytes, then rank on measured time. Records every rejection."""
     import paddle
 
@@ -755,7 +758,6 @@ def _scan(name, factory, candidates, plain, key, make_outputs, launch,
 
     t0 = time.time()
     rejected = []
-    hints = []
 
     # -- pass 1: bytes -------------------------------------------------------
     references = []
@@ -769,7 +771,6 @@ def _scan(name, factory, candidates, plain, key, make_outputs, launch,
         del outs
     survivors = [uniq[0]]
     for cfg in uniq[1:]:
-        hint = None
         bad = None
         for s in range(max(input_sets, 1)):
             if reseed is not None:
@@ -783,22 +784,6 @@ def _scan(name, factory, candidates, plain, key, make_outputs, launch,
                        "error": f"{type(exc).__name__}: {exc}"}
                 del outs
                 break
-            if s == 0 and hint_probe is not None:
-                # After the first launch, so that whatever the toolchain
-                # actually compiled exists to be looked at. A hint that was
-                # accepted syntactically and then dropped (cuTile drops
-                # ``occupancy=k`` whenever k CTAs of shared memory do not fit)
-                # compiles to the same code, and timing it again as if it were
-                # a distinct candidate is how a knob gets believed.
-                try:
-                    hint = hint_probe(cfg)
-                except Exception as exc:
-                    hint = {"error": f"{type(exc).__name__}: {exc}"}
-                if hint and hint.get("requested") and hint.get("blocks") \
-                        and hint["blocks"] < hint["requested"]:
-                    bad = {"hint": hint}
-                    del outs
-                    break
             got = [raw_bytes(t) for t in outs]
             if got != references[s]:
                 bad = {"input_set": s, "differing_outputs": [
@@ -808,22 +793,13 @@ def _scan(name, factory, candidates, plain, key, make_outputs, launch,
                 break
             del outs
         if bad is not None:
-            if "hint" in bad:
-                reason = "hint_reverted"
-            elif "error" in bad:
-                reason = "failed"
-            else:
-                reason = "not_bit_exact"
             rejected.append({
                 "config": cfg,
-                "reason": reason,
+                "reason": "failed" if "error" in bad else "not_bit_exact",
                 "detail": bad,
-                "hint": hint,
             })
             continue
         survivors.append(cfg)
-        if hint:
-            hints.append({"config": cfg, "hint": hint})
     if reseed is not None:
         reseed(0)
     gate_seconds = time.time() - t0
@@ -855,7 +831,6 @@ def _scan(name, factory, candidates, plain, key, make_outputs, launch,
         "bit_exact_input_sets": max(input_sets, 1),
         "timings": timings,
         "rejected": rejected,
-        "hints_accepted": hints,
         "candidates_considered": len(uniq),
         "gate_seconds": gate_seconds,
         "scan_seconds": time.time() - t0,
