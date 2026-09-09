@@ -2465,11 +2465,12 @@ if _CUTILE_AVAILABLE:
             # Optimized: TM=64, TK=128 is fastest (0.186ms vs 0.208ms@128/128)
             TILE_SIZE_M, TILE_SIZE_K = 64, 128
             # opt/mhc_0908: the grid here is one block per K tile, so
-            # TILE_SIZE_K=128 with K=n*hidden_size=16384 launches 128 blocks on
-            # a 148-SM part -- 20 SMs stay empty for the whole kernel, and each
-            # block then walks all M/TILE_SIZE_M m-tiles serially. Filling the
-            # part with TK=64 looked like the obvious fix and is 1.54x SLOWER
-            # (432.4 us vs 281.6 at TM=64), as is every other legal
+            # TILE_SIZE_K=128 with K=n*hidden_size=16384 launches 128 blocks,
+            # fewer than the multiprocessor count of the part this was measured
+            # on -- some multiprocessors stay empty for the whole kernel, and
+            # each block then walks all M/TILE_SIZE_M m-tiles serially. Filling
+            # the part with TK=64 looked like the obvious fix and is 1.54x
+            # SLOWER (432.4 us vs 281.6 at TM=64), as is every other legal
             # combination: the shipped (64, 128) is the best of the eight
             # measured. So the defaults here are the shipped values and this is
             # a knob only.
