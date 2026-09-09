@@ -149,6 +149,55 @@ def _mhc_live_budget() -> int:
 _SECTOR_BYTES = 128
 
 
+def _mhc_dtype_bytes(dtype) -> int:
+    """Bytes per element of a paddle dtype, without allocating a tensor."""
+    import paddle
+
+    try:
+        return paddle.empty([0], dtype=dtype).element_size()
+    except Exception:
+        return 2
+
+
+def _mhc_tile_bound(tiled_bytes: int, rows: int, tile_rows: int,
+                    tile_row_bytes: int):
+    """Microseconds a tile shape cannot beat, or ``None`` when not computable.
+
+    A lower bound, used only to drop candidates that cannot beat one already
+    measured so that their compilation is never paid -- and compilation is 98%
+    of a scan. It deliberately does not rank: two shapes with equal bounds have
+    measured 1.7-2.6% apart, and predicting speed from static numbers has been
+    wrong here by 3.7x.
+
+    Two terms, both of them true floors:
+
+    * **Sector waste.** A tile row of R bytes with R < 128 still costs a full
+      128 B transaction, so the traffic is at least ``128 / R`` times the useful
+      bytes. This is what makes the very narrow tiles hopeless -- measured 2.4x
+      to 32x slower than the winner -- and it prunes them by arithmetic instead
+      of by the shape of a sampling heuristic.
+    * **Idle multiprocessors.** With fewer blocks than multiprocessors, at most
+      ``grid`` of them can be busy, so the time is at least ``SMs / grid`` times
+      the ideal.
+
+    ``tiled_bytes`` must count only traffic that the tile actually governs, and
+    counting less than the truth is the safe direction: every term here makes
+    the bound smaller than the real floor, never larger, so pruning by it cannot
+    discard a candidate that would have won.
+    """
+    from paddlefleet.autotune import machine_facts, peak_bytes_per_us
+
+    bw = peak_bytes_per_us()
+    if bw <= 0 or tiled_bytes <= 0 or tile_rows <= 0:
+        return None
+    ideal = tiled_bytes / bw
+    inflate = max(1.0, _SECTOR_BYTES / max(tile_row_bytes, 1))
+    sm = machine_facts().get("multiProcessorCount") or 0
+    grid = math.ceil(rows / tile_rows)
+    starve = max(1.0, sm / grid) if (sm and grid) else 1.0
+    return ideal * max(inflate, starve)
+
+
 def _mhc_pair_candidates(factory, rows, cols, per_elem_bytes, elem_bytes,
                          count=8):
     """``(rows, cols)`` tile candidates around the shipped pair.
@@ -352,392 +401,24 @@ def _get_cuda_stream():
     return paddle.device.current_stream().stream_base.cuda_stream
 
 
-# ---------------------------------------------------------------------------
-# Register-cap switch (opt/mhc_regs_0908) -- independent of the tile switch
-# ---------------------------------------------------------------------------
-# Six kernels in this family compile to exactly 255 registers/thread and sit at
-# 8 resident warps out of 64. That is not register pressure: cuTile emits
-# ``.reqntid <ntid>`` + ``.minnctapersm 1`` into the PTX and passes ptxas *no*
-# register limit, so ptxas sizes registers for "one CTA per SM is enough" and
-# takes the whole file -- 255 at ntid=256, and exactly 168 at ntid=384
-# (= 65536/384 rounded down to the 8-register granularity), which is the
-# cleanest proof that the number is a budget and not a saturation point.
-# ``-maxrregcount`` cannot change it (ptxas ignores it when the kernel carries
-# launch bounds); the only channel that works is the PTX directive ``.maxnreg``.
-#
-# cuTile's public ``occupancy=k`` does emit ``.maxnreg``, but it also rewrites
-# the shared-memory pipeline, which changes instruction order -- measured NOT
-# bit-exact on hpb_bwd (14288 elements differ at k=2). This switch instead adds
-# ``.maxnreg`` to the PTX cuTile already generated and re-runs the same ptxas
-# command: the PTX body is unchanged, so the arithmetic and every reduction
-# order are unchanged by construction, and 20 input sets (half of them built to
-# expose reassociation) confirm max|diff| == 0 for every cap used here
-# (opt/mhc_regs_0908/logs/bitexact_regs.json).
-#
-# Seeing the PTX at all needs a tileiras copy with a ptxas wrapper next to it,
-# because tileiras resolves ptxas relative to its own /proc/self/exe. That is
-# built on demand under $PADDLEFLEET_MHC_REGCAP_DIR (default /tmp/...). If any
-# of it fails the original kernel is used, so the switch can only be a no-op or
-# a win, never a crash. Default: OFF -- with the variable unset this file
-# behaves exactly as it did before.
-_MHC_REGCAP_ENV = "PADDLEFLEET_MHC_REGCAP"
-
-# Which register count to ask for is NOT written down here, because it is a
-# property of the machine: the whole reason a cap helps is that ptxas was given
-# the register file of one SM to spend on one CTA. What is written down is how
-# many resident CTAs per SM each kernel wants, which is a property of the
-# kernel, and the register budget follows from
-# ``regsPerMultiprocessor / (target_ctas * ntid)`` rounded down to the
-# 8-register granularity -- ``regsPerMultiprocessor`` read from the driver and
-# ``ntid`` read out of the ``.reqntid`` the PTX carries, so neither appears as
-# a literal (paddlefleet.autotune.reg_cap_for_ctas).
-#
-# The three targets below reproduce the three caps that were swept by hand on
-# this machine exactly (65536 regs/SM: 2 CTAs at ntid=256 -> 128, 4 -> 64,
-# 6 at ntid=128 -> 80), and follow the register file to a different number on a
-# machine with a different one. Measured on production shapes, median of 100
-# launches after 20 warmup, card certified idle before and after
-# (opt/mhc_regs_0908/RESULT.md 5):
-#   hpb_bwd       714.8 -> 504.4 us  (1.417x)   2 CTAs/SM, 12.5% -> 25% occ
-#   sinkhorn_fwd   44.4 ->  30.2 us  (1.467x)   4 CTAs/SM, 12.5% -> 50% occ
-#   hpb_fwd       384.0 -> 319.6 us  (1.202x)   6 CTAs/SM, on a *tuned* tile
-#                                               only -- at the shipped
-#                                               (1,4096) every cap spills.
-#
-# ``hpb_fwd`` no longer appears below: its target is a tuned quantity like its
-# tile, offered as ``RC`` candidates by ``_mhc_rc_candidates`` and chosen by the
-# same gate and timing. The earlier reasoning for not tuning it was backwards --
-# "the cap is bit-exact by construction, so the gate cannot separate the
-# candidates and the whole cost would be timing" means the *gate is free*, which
-# makes it the cheapest thing in this file to tune, not a reason to skip it.
-#
-# The two entries that remain are hand-swept values on one machine and one
-# shape, which is the thing this module exists to stop doing. They are still
-# here only because their kernels are not behind the tuner yet: ``hpb_bwd`` and
-# ``sinkhorn_fwd`` are launched directly, with no ``make_outputs`` / ``launch``
-# pair for a scan to drive. Giving them one is the same work as moving the scan
-# out of this module, so it belongs with that change rather than being rushed
-# ahead of it. Until then they stay behind the opt-in switch and are documented
-# as unproven anywhere but where they were measured.
-#
-# The rest of the family was swept and is slower under any cap at the tiles it
-# runs with (h_agg_bwd, sinkhorn_bwd and h_agg_fwd at the tuned tiles;
-# proj_rms_fwd/bwd because shared memory alone already limits them to one CTA
-# per SM), so they are deliberately absent.
-_MHC_REGCAP_TARGET_CTAS = {"hpb_bwd": 2, "sinkhorn_fwd": 4}
-
-#: Most resident CTAs worth asking for. Not a tuning choice: past this the
-#: register budget per thread falls below what any of these kernels can hold, so
-#: the candidates would all spill. The real bound is the shared-memory one
-#: computed per shape in :func:`_mhc_rc_candidates`; this only stops the list
-#: from growing without limit on a part with a lot of shared memory.
-_MHC_RC_MAX = 8
-
-#: At most this many cap targets, so the tile sweep keeps most of the budget.
-#: Three is enough for geometric coverage of a range this short.
-_MHC_RC_SLOTS = 3
 
 
-def _mhc_rc_candidates(tile_pair, per_elem_bytes: int) -> list:
-    """Register-cap targets worth measuring for one tile, or ``[]``.
-
-    Empty unless the cap is switched on, so this changes nothing by default:
-    the cap rebuilds the kernel through the toolchain, which is a real failure
-    surface and stays opt-in.
-
-    The list is derived, not written down. Capping registers only buys residency
-    when registers -- and not shared memory -- are what limits it, so the useful
-    targets are ``2 .. smem_per_sm / smem_per_cta``: asking for more than shared
-    memory allows cannot raise residency and only spills, which is exactly the
-    "in effect but harmful" outcome that got a previous round of hardcoded launch
-    configurations reverted. ``0`` (no cap) is always among the candidates
-    because it is the factory behaviour and has to be able to win.
-    """
-    if not _mhc_regcap_on():
-        return []
-    per_cta = (tile_pair[0] or 0) * (tile_pair[1] or 0) * per_elem_bytes
-    if per_cta <= 0:
-        return []
-    from paddlefleet.autotune import machine_facts
-
-    per_sm = machine_facts().get("sharedMemPerMultiprocessor") or 0
-    if per_sm <= 0:
-        return []
-    limit = min(per_sm // per_cta, _MHC_RC_MAX)
-    if limit < 2:
-        return []
-    # Geometric coverage (widest, half, smallest meaningful) rather than every
-    # value: the returns are not monotone in the target -- measured best at 6
-    # CTAs for one kernel of this family, 4 for another and 2 for a third -- and
-    # enumerating 2..limit would spend the whole eight-candidate budget here,
-    # starving the tile sweep, which is worth more (1.9x spread across tiles
-    # against 1.2% for the best cap).
-    out = []
-    for v in (limit, limit // 2, 2):
-        if v >= 2 and v not in out and len(out) < _MHC_RC_SLOTS:
-            out.append(v)
-    return out
-
-_MHC_REGCAP_KERNELS: dict = {}
-_MHC_REGCAP_STATE: dict = {}
 
 
-def _mhc_regcap_on() -> bool:
-    """True when the register cap is requested. Default: off."""
-    return os.environ.get(_MHC_REGCAP_ENV, "0").lower() not in (
-        "",
-        "0",
-        "false",
-        "off",
-        "no",
-    )
 
 
-def _mhc_regcap_target(name: str) -> int:
-    """Resident CTAs/SM to size registers for, or 0 for "do not cap".
-
-    Only for the kernels that are not behind the tuner yet. A tuned kernel gets
-    its target from the chosen configuration (``RC``) instead, so that the cap
-    and the tile can never disagree about which pair was actually measured.
-    """
-    env = f"{_MHC_REGCAP_ENV}_CTAS_{name.upper()}"
-    raw = os.environ.get(env)
-    if raw is not None:
-        try:
-            return int(raw)
-        except ValueError:
-            return 0
-    return _MHC_REGCAP_TARGET_CTAS.get(name, 0)
 
 
-def _mhc_regcap_toolkit():
-    """Build (once) a toolkit layout whose ptxas is a PTX-rewriting wrapper.
-
-    Returns the path of the tileiras copy to drive, or None if it cannot be
-    built -- callers must treat None as "leave the kernel alone".
-    """
-    if "toolkit" in _MHC_REGCAP_STATE:
-        return _MHC_REGCAP_STATE["toolkit"]
-    _MHC_REGCAP_STATE["toolkit"] = None
-    try:
-        import shutil
-
-        real = shutil.which("tileiras") or "/usr/local/cuda/bin/tileiras"
-        real = os.path.realpath(real)
-        root = os.path.dirname(os.path.dirname(real))
-        base = os.environ.get(
-            f"{_MHC_REGCAP_ENV}_DIR",
-            os.path.join("/tmp", f"pdc_mhc_regcap_{os.getuid()}"),
-        )
-        bin_dir = os.path.join(base, "bin")
-        os.makedirs(bin_dir, exist_ok=True)
-        tileiras = os.path.join(bin_dir, "tileiras")
-        if not os.path.exists(tileiras):
-            tmp = tileiras + f".{os.getpid()}"
-            shutil.copy2(real, tmp)
-            os.replace(tmp, tileiras)
-        for link in ("nvvm", "lib64"):
-            dst = os.path.join(base, link)
-            if not os.path.exists(dst):
-                try:
-                    os.symlink(os.path.join(root, link), dst)
-                except FileExistsError:
-                    pass
-        ptxas = os.path.join(bin_dir, "ptxas")
-        if not os.path.exists(ptxas):
-            real_ptxas = os.path.join(root, "bin", "ptxas")
-            tmp = ptxas + f".{os.getpid()}"
-            with open(tmp, "w") as f:
-                f.write(
-                    "#!/bin/sh\n"
-                    "# Written by paddlefleet fused_mhc_kernels "
-                    "(PADDLEFLEET_MHC_REGCAP).\n"
-                    "# Keeps the PTX tileiras generated plus its argv, then\n"
-                    "# runs the real ptxas unchanged.\n"
-                    'OUT="${PTX_CAPTURE_DIR:-/tmp}"\n'
-                    'mkdir -p "$OUT"\n'
-                    'for a in "$@"; do\n'
-                    '  case "$a" in\n'
-                    '    *.ptx) cp "$a" "$OUT/in.ptx" ;;\n'
-                    '    --nv-host=*) cp "${a#--nv-host=}" "$OUT/nvhost.o"'
-                    " 2>/dev/null ;;\n"
-                    "  esac\n"
-                    "done\n"
-                    'printf "%s\\n" "$@" > "$OUT/argv.txt"\n'
-                    f'exec {real_ptxas} "$@"\n'
-                )
-            os.chmod(tmp, 0o755)
-            os.replace(tmp, ptxas)
-        _MHC_REGCAP_STATE["toolkit"] = tileiras
-        _MHC_REGCAP_STATE["ptxas"] = os.path.join(root, "bin", "ptxas")
-    except Exception as exc:  # pragma: no cover - environment dependent
-        print(
-            f"[paddlefleet] {_MHC_REGCAP_ENV}: cannot build the ptxas wrapper "
-            f"({exc}); running the uncapped kernels.",
-            flush=True,
-        )
-    return _MHC_REGCAP_STATE["toolkit"]
 
 
-def _mhc_regcap_cubin(bytecode: bytes, target_ctas: int, arch: str) -> bytes:
-    """TileIR bytecode -> PTX -> ``+ .maxnreg`` -> ptxas -> cubin.
-
-    The cap itself is computed here and nowhere else, because this is the first
-    point at which both halves of it are available: ``ntid`` from the
-    ``.reqntid`` the PTX carries, and ``regsPerMultiprocessor`` from the
-    driver. Writing the product down instead would be writing down one
-    machine's register file.
-    """
-    import hashlib
-    import re
-    import subprocess
-    import tempfile
-
-    from paddlefleet.autotune import machine_facts, reg_cap_for_ctas
-
-    tileiras = _mhc_regcap_toolkit()
-    if tileiras is None:
-        raise RuntimeError("no ptxas wrapper")
-    base = os.path.dirname(os.path.dirname(tileiras))
-    cache = os.path.join(base, "cubins")
-    os.makedirs(cache, exist_ok=True)
-    key = hashlib.sha1(bytes(bytecode)).hexdigest()[:16]
-    facts = machine_facts()
-    memo = os.path.join(
-        cache,
-        f"{key}_ctas{target_ctas}_r{facts.get('regsPerMultiprocessor', 0)}"
-        f"_{arch}.cubin",
-    )
-    if os.path.exists(memo):
-        with open(memo, "rb") as f:
-            return f.read()
-
-    work = tempfile.mkdtemp(prefix="mhc_regcap_")
-    bc = os.path.join(work, "k.tileirbc")
-    with open(bc, "wb") as f:
-        f.write(bytes(bytecode))
-    env = dict(os.environ, PTX_CAPTURE_DIR=work)
-    r = subprocess.run(
-        [tileiras, bc, "-o", os.path.join(work, "t.cubin"),
-         "--gpu-name", arch, "-O3", "--lineinfo"],
-        env=env, capture_output=True, text=True, timeout=3600,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(f"tileiras: {r.stderr[-200:]}")
-    with open(os.path.join(work, "in.ptx")) as f:
-        ptx = f.read()
-    if ".maxnreg" in ptx:
-        raise RuntimeError("PTX already carries a register cap")
-    ntid_m = re.search(r"\.reqntid\s+(\d+)", ptx)
-    if ntid_m is None:
-        raise RuntimeError("no .reqntid to size the register budget against")
-    ntid = int(ntid_m.group(1))
-    cap = reg_cap_for_ctas(ntid, target_ctas, facts)
-    if cap <= 0:
-        raise RuntimeError(
-            f"{target_ctas} CTAs/SM at ntid={ntid} needs no cap on this "
-            f"machine ({facts.get('regsPerMultiprocessor')} regs/SM)"
-        )
-    m = re.search(r"(\.minnctapersm\s+\d+\s*\n)", ptx) or re.search(
-        r"(\.reqntid\s+\d+\s*\n)", ptx)
-    if m is None:
-        raise RuntimeError("no launch bounds to anchor .maxnreg on")
-    capped = os.path.join(work, "capped.ptx")
-    with open(capped, "w") as f:
-        f.write(ptx[: m.end()] + f".maxnreg {cap}\n" + ptx[m.end():])
-
-    with open(os.path.join(work, "argv.txt")) as f:
-        argv = [a for a in f.read().split("\n") if a]
-    out = os.path.join(work, "capped.cubin")
-    cmd, skip = [_MHC_REGCAP_STATE["ptxas"]], False
-    for a in argv:
-        if skip:
-            skip = False
-            continue
-        if a.endswith(".ptx"):
-            cmd.append(capped)
-        elif a == "-o":
-            cmd.extend([a, out])
-            skip = True
-        elif a.startswith("--nv-host="):
-            cmd.append("--nv-host=" + os.path.join(work, "nvhost.o"))
-        else:
-            cmd.append(a)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    if r.returncode != 0:
-        raise RuntimeError(f"ptxas at cap={cap}: {r.stderr[-200:]}")
-    with open(out, "rb") as f:
-        blob = f.read()
-    tmp = memo + f".{os.getpid()}"
-    with open(tmp, "wb") as f:
-        f.write(blob)
-    os.replace(tmp, memo)
-    return blob
 
 
-def _mhc_regcap_class():
-    """The ``ct.kernel`` subclass that rebuilds its cubin with a cap."""
-    cls = _MHC_REGCAP_STATE.get("class")
-    if cls is not None:
-        return cls
-
-    class _MhcRegCapKernel(ct.kernel):
-        _mhc_target_ctas = 0
-
-        def _compile(self, signature, context):
-            from cuda.tile._compile import compile_tile, get_sm_arch
-
-            arch = get_sm_arch()
-            res = compile_tile(
-                self._annotated_function, (signature,), arch,
-                self._compiler_options, context,
-                return_bytecode=True, return_cubin=False,
-            )
-            [sig] = res.kernel_signatures
-            cubin = _mhc_regcap_cubin(res.bytecode, self._mhc_target_ctas,
-                                      arch)
-            return cubin, sig.symbol, None, []
-
-    _MHC_REGCAP_STATE["class"] = _MhcRegCapKernel
-    return _MhcRegCapKernel
 
 
-def _mhc_reg_capped(kernel, name: str, ctas: int | None = None):
-    """``kernel``, or a bit-identical copy of it sized for N CTAs per SM.
 
-    Returns ``kernel`` itself unless the switch is on, a target is configured
-    for ``name``, and the rebuild succeeds -- so this is a no-op by default and
-    degrades to a no-op on any failure. Cached: this is on the launch path.
 
-    ``ctas`` states the target explicitly; that is how a tuned kernel passes the
-    value its own scan selected. Left out, the target comes from the table for
-    the kernels that are not tuned yet.
-    """
-    if not _mhc_regcap_on():
-        return kernel
-    if ctas is None:
-        ctas = _mhc_regcap_target(name)
-    if ctas <= 0:
-        return kernel
-    key = (name, ctas)
-    got = _MHC_REGCAP_KERNELS.get(key)
-    if got is None:
-        try:
-            import dataclasses
 
-            opts = dataclasses.asdict(kernel._compiler_options)
-            capped = _mhc_regcap_class()(kernel._pyfunc, **opts)
-            capped._mhc_target_ctas = ctas
-            got = capped
-        except Exception as exc:
-            print(
-                f"[paddlefleet] {_MHC_REGCAP_ENV}: {name} target {ctas} "
-                f"CTAs/SM not applied ({exc}); running the uncapped kernel.",
-                flush=True,
-            )
-            got = kernel
-        _MHC_REGCAP_KERNELS[key] = got
-    return got
+
 
 
 # ============================================================================
@@ -867,7 +548,7 @@ if _CUTILE_AVAILABLE:
         ct.launch(
             _get_cuda_stream(),
             (math.ceil(N_batch / TILE_SIZE), 1, 1),
-            _mhc_reg_capped(_ct_sinkhorn_fwd_kernel, "sinkhorn_fwd"),
+            _ct_sinkhorn_fwd_kernel,
             (
                 input_logits.reshape([N_batch, hc, hc]),
                 out,
@@ -1957,14 +1638,8 @@ if _CUTILE_AVAILABLE:
                 return (paddle.empty(shape=[sb, n, C], dtype=out_dtype),)
 
             def kernel_for(cfg):
-                # opt/mhc_regs_0908: the ``.maxnreg`` rebuild only pays off on
-                # some tiles (at the shipped (1, 4096) every cap spills), and
-                # which target is best is a measurement, not a constant. So the
-                # target rides in the configuration as ``RC`` and is decided by
-                # the same gate and timing as the tile -- the cap and the tile
-                # can then never disagree about which pair was measured.
-                k = _mhc_with_occupancy(_ct_hpb_fwd_kernel, cfg.get("OCC", 0))
-                return _mhc_reg_capped(k, "hpb_fwd", ctas=cfg.get("RC", 0))
+                return _mhc_with_occupancy(_ct_hpb_fwd_kernel,
+                                           cfg.get("OCC", 0))
 
             def do_launch(cfg, outs):
                 ts, tc = cfg["TILE_SIZE"], cfg["TILE_C"]
@@ -1992,29 +1667,15 @@ if _CUTILE_AVAILABLE:
             # otherwise they would be silently dropped by the truncation and
             # look as though they had been tried.
             occ = _mhc_occ_candidates(SHIPPED, bias is None, n * 4 * 2)
-            # The register-cap targets are candidates too, and they are worth
-            # more than an extra tile only where the tile has already moved:
-            # they are offered on the *tuned* pairs, not on the shipped one.
-            # Empty unless the cap switch is on, so the default candidate set
-            # is unchanged.
-            rcs = _mhc_rc_candidates(SHIPPED, n * 4 * 2)
             pairs = _mhc_pair_candidates(
                 SHIPPED, sb, C, n * 4 * 2,
-                original_residual.element_size(),
-                count=8 - len(occ) - len(rcs))
-            cands = [{"TILE_SIZE": r, "TILE_C": c, "OCC": 0, "RC": 0}
-                     for r, c in pairs]
-            cands += [dict(c, RC=0) for c in occ]
-            if rcs and len(pairs) > 1:
-                # On the widest non-shipped pair the generator produced, which
-                # is the one the tile sweep is most likely to settle on.
-                r, c = pairs[1]
-                cands += [{"TILE_SIZE": r, "TILE_C": c, "OCC": 0, "RC": v}
-                          for v in rcs]
+                original_residual.element_size(), count=8 - len(occ))
+            cands = [{"TILE_SIZE": r, "TILE_C": c, "OCC": 0} for r, c in pairs]
+            cands += occ
             return _mhc_autotune_call(
                 name="mhc.hpb_fwd",
                 factory={"TILE_SIZE": SHIPPED[0], "TILE_C": SHIPPED[1],
-                         "OCC": 0, "RC": 0},
+                         "OCC": 0},
                 candidates=cands,
                 launch_shape=(sb, n, C),
                 dtypes=(h_res.dtype, original_residual.dtype, h_post.dtype,
@@ -2023,6 +1684,16 @@ if _CUTILE_AVAILABLE:
                 kernels=(_ct_hpb_fwd_kernel, _ct_hpb_fwd_bias_kernel),
                 make_outputs=make_outputs,
                 launch=do_launch,
+                # Only the traffic the tile actually governs is counted: the
+                # [sb, n, C] residual read and the [sb, n, C] output write.
+                # Undercounting keeps the bound below the real floor, which is
+                # the safe direction -- pruning by too small a bound is merely
+                # weaker, pruning by too large a one could discard the winner.
+                bound=lambda cfg, _res=original_residual,
+                _ob=_mhc_dtype_bytes(out_dtype): _mhc_tile_bound(
+                    sb * n * C * (_res.element_size() + _ob),
+                    sb, cfg["TILE_SIZE"],
+                    cfg["TILE_C"] * _res.element_size()),
             )
 
         cfg = _mhc_tune(
@@ -2031,12 +1702,9 @@ if _CUTILE_AVAILABLE:
             _tune_hpb_fwd,
         )
         if cfg is None:
-            cfg = {"TILE_SIZE": SHIPPED[0], "TILE_C": SHIPPED[1],
-                   "OCC": 0, "RC": 0}
+            cfg = {"TILE_SIZE": SHIPPED[0], "TILE_C": SHIPPED[1], "OCC": 0}
         TILE_SIZE, TILE_C = cfg["TILE_SIZE"], cfg["TILE_C"]
         fwd_kernel = _mhc_with_occupancy(_ct_hpb_fwd_kernel, cfg.get("OCC", 0))
-        fwd_kernel = _mhc_reg_capped(fwd_kernel, "hpb_fwd",
-                                     ctas=cfg.get("RC", 0))
         out = paddle.empty(shape=[sb, n, C], dtype=out_dtype)
         grid = (math.ceil(sb / TILE_SIZE),)
         if bias is not None:
@@ -2129,7 +1797,7 @@ if _CUTILE_AVAILABLE:
             ct.launch(
                 _get_cuda_stream(),
                 grid,
-                _mhc_reg_capped(_ct_hpb_bwd_kernel, "hpb_bwd"),
+                _ct_hpb_bwd_kernel,
                 (
                     grad_output.reshape([sb, n, C]),
                     h_res.reshape([sb, n, n]),

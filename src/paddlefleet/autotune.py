@@ -134,6 +134,12 @@ _ATTRS = {
     "warpSize": "WARP_SIZE",
     "major": "COMPUTE_CAPABILITY_MAJOR",
     "minor": "COMPUTE_CAPABILITY_MINOR",
+    # For the lower bound that prunes candidates before they are compiled.
+    # Theoretical peak, not a measured one, and that is the safe direction: a
+    # bandwidth that is too high makes every bound too small, so the pruning is
+    # looser than it could be but never discards a candidate that could win.
+    "memClockRate": "MEMORY_CLOCK_RATE",           # kHz
+    "memBusWidth": "GLOBAL_MEMORY_BUS_WIDTH",      # bits
 }
 
 
@@ -225,33 +231,6 @@ def toolchain_facts() -> dict:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Register budget: computed, not swept (see the module docstring on .maxnreg)
-# ---------------------------------------------------------------------------
-def reg_cap_for_ctas(ntid: int, target_ctas: int,
-                     facts: dict | None = None) -> int:
-    """Registers per thread that leave room for ``target_ctas`` CTAs per SM.
-
-    ``regsPerMultiprocessor / (target_ctas * ntid)``, rounded down to the
-    8-register allocation granularity and clamped to the architectural
-    maximum. The only machine-dependent quantity is read here; how many
-    resident CTAs a given kernel wants is a property of the kernel, not of the
-    machine, so it stays with the kernel.
-
-    Returns 0 when the budget would exceed the architectural maximum, i.e.
-    when the request is already satisfied without a cap -- callers treat 0 as
-    "do not cap".
-    """
-    facts = machine_facts() if facts is None else facts
-    regs_per_sm = facts.get("regsPerMultiprocessor")
-    if not regs_per_sm or ntid <= 0 or target_ctas <= 0:
-        return 0
-    # The per-thread ceiling ptxas can encode. Also read, not written down.
-    ceiling = min(255, facts.get("regsPerBlock", 255) // max(ntid, 1))
-    cap = (regs_per_sm // (target_ctas * ntid)) // 8 * 8
-    if cap <= 0 or cap >= ceiling:
-        return 0
-    return cap
 
 
 def ctas_per_sm(regs: int, ntid: int, smem: int,
@@ -637,6 +616,7 @@ def tune(
     iters: int = MIN_ITERS,
     input_sets: int = 1,
     reseed=None,
+    bound=None,
     key_extra=None,
 ) -> dict:
     """Return the launch configuration to use for one kernel at one shape.
@@ -649,6 +629,12 @@ def tune(
     silently ignore compiles to the same code as another candidate and would be
     timed as though it were distinct, so the caller keeps it out of the list
     (see ``ctas_per_sm``) instead of the tuner detecting it afterwards.
+
+    ``bound(cfg)`` may return a lower bound in microseconds on what ``cfg`` can
+    achieve. It is used only to drop candidates that cannot beat one already
+    measured, which saves their compilation -- the expensive part. It must be a
+    genuine lower bound: too small only weakens the pruning, while too large
+    would discard a winner.
 
     Never raises: every failure path returns ``factory``.
     """
@@ -730,7 +716,7 @@ def tune(
         try:
             record = _scan(name, factory, candidates, plain, key,
                            make_outputs, launch, warmup, iters,
-                           input_sets, reseed)
+                           input_sets, reseed, bound)
         except Exception as exc:
             _warn(f"{name}: scan failed ({type(exc).__name__}: {exc}); "
                   f"using the factory configuration "
@@ -741,9 +727,57 @@ def tune(
     return dict(record["config"])
 
 
+def peak_bytes_per_us(facts: dict | None = None) -> float:
+    """Theoretical peak DRAM bytes per microsecond, or 0 when unknown.
+
+    Theoretical, not measured, and that is the safe direction for a lower bound
+    on time: too high a bandwidth makes every bound too small, so pruning is
+    looser than it could be and never discards a candidate that could have won.
+    """
+    facts = machine_facts() if facts is None else facts
+    khz, bits = facts.get("memClockRate"), facts.get("memBusWidth")
+    if not khz or not bits:
+        return 0.0
+    return 2.0 * khz * 1e3 * (bits / 8.0) / 1e6
+
+
 def _scan(name, factory, candidates, plain, key, make_outputs, launch,
-          warmup, iters, input_sets, reseed) -> dict:
-    """Gate on bytes, then rank on measured time. Records every rejection."""
+          warmup, iters, input_sets, reseed, bound=None) -> dict:
+    """Measure, pruning by a lower bound first; verify the winner's bytes last.
+
+    ## Why this order
+
+    Cost is dominated by compilation: each candidate's first launch compiles it,
+    and measured on production shapes the pass that first launches every
+    candidate was 98% of the scan (13.0 s of 13.2, 22.1 of 22.3). So the way to
+    make a scan cheap is to compile fewer candidates, not to time them less.
+
+    Two changes follow from that:
+
+    * **A lower bound prunes before compiling.** ``bound(cfg)`` returns
+      microseconds that ``cfg`` cannot beat. Once some candidate has been
+      measured at ``t_best``, any candidate whose bound is already >= ``t_best``
+      cannot win and is dropped without being built. This is sound in one
+      direction only, which is the direction used: a lower bound can be
+      exceeded, never undercut, so pruning by it cannot discard the winner.
+      Candidates are tried in increasing bound order so that the cheap
+      information arrives first and prunes the most.
+    * **The bit-exactness gate runs on the winner, not on everybody.** It used
+      to launch every candidate and copy every output tensor back to the host to
+      compare bytes -- on a production shape that is hundreds of megabytes per
+      candidate per input set, plus a fresh output allocation each time, inside
+      a training step. Verifying in speed order and stopping at the first
+      candidate that passes gives the same answer: a candidate that is not
+      bit-exact is rejected before it can be returned, and if the fastest one
+      fails, the next fastest is checked. The only case that costs more than
+      before is one where several of the fastest candidates change the output,
+      which has not happened on this family.
+
+    What is deliberately *not* claimed: the bound does not rank candidates. It
+    could not -- two configurations with identical bounds have measured 1.7-2.6%
+    apart, and static predictions of speed have been wrong here by 3.7x. It only
+    says who cannot win.
+    """
     import paddle
 
     uniq = [dict(factory)]
@@ -759,80 +793,128 @@ def _scan(name, factory, candidates, plain, key, make_outputs, launch,
     t0 = time.time()
     rejected = []
 
-    # -- pass 1: bytes -------------------------------------------------------
-    references = []
-    for s in range(max(input_sets, 1)):
-        if s and reseed is not None:
-            reseed(s)
+    bound_broken = []
+
+    def bound_of(cfg):
+        """The caller's lower bound, or None. A broken bound is loud.
+
+        It must be loud: a bound that raises used to be swallowed into None,
+        which silently turned the pruning off. That is exactly how this function
+        was first landed against the wrong call site -- the lambda referred to
+        names that did not exist there, every candidate came back unbounded, and
+        the only symptom was that nothing got pruned.
+        """
+        if bound is None:
+            return None
+        try:
+            v = bound(cfg)
+        except Exception as exc:
+            if not bound_broken:
+                bound_broken.append(f"{type(exc).__name__}: {exc}")
+                _warn(f"{name}: the lower bound raised "
+                      f"({bound_broken[0]}); pruning is off for this scan, so "
+                      f"every candidate will be compiled.")
+            return None
+        return v if v and v > 0 else None
+
+    # The factory config is measured first and unconditionally: it is the
+    # bit-exactness reference, it is what we fall back to, and its time is what
+    # gives the pruning something to prune against.
+    def measure(cfg):
         outs = make_outputs()
-        launch(uniq[0], outs)
+        launch(cfg, outs)                      # compiles on the first launch
         paddle.device.synchronize()
-        references.append([raw_bytes(t) for t in outs])
+        t = time_median_us(lambda: launch(cfg, outs), warmup, iters)
         del outs
-    survivors = [uniq[0]]
-    for cfg in uniq[1:]:
+        return t
+
+    timings = [{"config": uniq[0], **measure(uniq[0])}]
+    t_best = timings[0]["us"]
+
+    rest = sorted(uniq[1:], key=lambda c: (bound_of(c) or 0.0))
+    for cfg in rest:
+        lb = bound_of(cfg)
+        if lb is not None and lb >= t_best:
+            rejected.append({"config": cfg, "reason": "bounded_out",
+                             "lower_bound_us": lb, "best_us": t_best})
+            continue
+        try:
+            t = measure(cfg)
+        except Exception as exc:
+            rejected.append({"config": cfg, "reason": "failed",
+                             "detail": {"error": f"{type(exc).__name__}: {exc}"}})
+            continue
+        timings.append({"config": cfg, "lower_bound_us": lb, **t})
+        t_best = min(t_best, t["us"])
+
+    timings.sort(key=lambda r: r["us"])
+
+    # -- verify bytes, fastest first, stop at the first that matches ----------
+    references = None
+    winner = None
+    gate_checked = 0
+    for r in timings:
+        if r["config"] == uniq[0]:
+            winner = uniq[0]           # the reference cannot differ from itself
+            break
+        if references is None:
+            references = []
+            for s in range(max(input_sets, 1)):
+                if s and reseed is not None:
+                    reseed(s)
+                outs = make_outputs()
+                launch(uniq[0], outs)
+                paddle.device.synchronize()
+                references.append([raw_bytes(t) for t in outs])
+                del outs
         bad = None
         for s in range(max(input_sets, 1)):
             if reseed is not None:
                 reseed(s)
             outs = make_outputs()
-            try:
-                launch(cfg, outs)
-                paddle.device.synchronize()
-            except Exception as exc:
-                bad = {"input_set": s,
-                       "error": f"{type(exc).__name__}: {exc}"}
-                del outs
-                break
+            launch(r["config"], outs)
+            paddle.device.synchronize()
             got = [raw_bytes(t) for t in outs]
+            del outs
             if got != references[s]:
                 bad = {"input_set": s, "differing_outputs": [
                     i for i, (a, b) in enumerate(zip(got, references[s]))
                     if a != b]}
-                del outs
                 break
-            del outs
-        if bad is not None:
-            rejected.append({
-                "config": cfg,
-                "reason": "failed" if "error" in bad else "not_bit_exact",
-                "detail": bad,
-            })
-            continue
-        survivors.append(cfg)
+        gate_checked += 1
+        if bad is None:
+            winner = r["config"]
+            break
+        rejected.append({"config": r["config"], "reason": "not_bit_exact",
+                         "detail": bad, "us": r["us"]})
     if reseed is not None:
         reseed(0)
-    gate_seconds = time.time() - t0
+    if winner is None:
+        winner = uniq[0]
 
-    # -- pass 2: measured time ----------------------------------------------
-    timings = []
-    for cfg in survivors:
-        outs = make_outputs()
-        launch(cfg, outs)
-        paddle.device.synchronize()
-        t = time_median_us(lambda cfg=cfg, outs=outs: launch(cfg, outs),
-                           warmup, iters)
-        del outs
-        timings.append({"config": cfg, **t})
-    timings.sort(key=lambda r: r["us"])
-    winner = timings[0]["config"]
     base = next(r for r in timings if r["config"] == uniq[0])
-    for r in timings[1:]:
-        rejected.append({"config": r["config"], "reason": "slower",
-                         "us": r["us"],
-                         "vs_winner": r["us"] / timings[0]["us"]})
+    win_t = next(r for r in timings if r["config"] == winner)
+    for r in timings:
+        if r["config"] != winner and r["config"] != uniq[0] \
+                and not any(x["config"] == r["config"] for x in rejected):
+            rejected.append({"config": r["config"], "reason": "slower",
+                             "us": r["us"],
+                             "vs_winner": r["us"] / win_t["us"]})
 
     return {
         "key": key,
         "config": winner,
         "factory": dict(factory),
-        "speedup_vs_factory": base["us"] / timings[0]["us"],
+        "speedup_vs_factory": base["us"] / win_t["us"],
         "bit_exact_vs_factory": True,
         "bit_exact_input_sets": max(input_sets, 1),
+        "bit_exact_candidates_checked": gate_checked,
         "timings": timings,
         "rejected": rejected,
         "candidates_considered": len(uniq),
-        "gate_seconds": gate_seconds,
+        "candidates_compiled": len(timings),
+        "peak_bytes_per_us": peak_bytes_per_us(),
+        "bound_error": bound_broken[0] if bound_broken else None,
         "scan_seconds": time.time() - t0,
         "measured": {"warmup": max(warmup, MIN_WARMUP),
                      "iters": max(iters, MIN_ITERS)},
