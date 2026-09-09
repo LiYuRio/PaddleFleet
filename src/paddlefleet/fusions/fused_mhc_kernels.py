@@ -28,9 +28,362 @@ Four fused operations:
 """
 
 import math
+import os
 
 import paddle
 from paddle import Tensor
+
+# ---------------------------------------------------------------------------
+# Tile shapes: autotuned, not written down (paddlefleet/autotune.py)
+# ---------------------------------------------------------------------------
+# Every launcher below used to pick its cuTile tile shape from a hardcoded
+# expression, and a previous round replaced four of those with a *second* set
+# of hardcoded expressions swept on one machine at one shape. Both are the
+# same mistake: the earlier instance of it -- six launch configurations
+# written down from one sweep, with no architecture test -- was "effective but
+# harmful" on another generation (3940 B of spill against 312 B, resident CTAs
+# per SM 2 -> 1) and had to be reverted in full.
+#
+# So the tile shapes are now decided by ``paddlefleet.autotune.tune``: the
+# candidate list is bounded by what the shape divides and by what an SM
+# actually has, every candidate must reproduce the shipped configuration's
+# output byte for byte before it is timed at all, and the winner is the
+# measured-fastest survivor. Nothing here needs a per-machine re-verification
+# of numerics; that is the property the bit-exactness gate buys.
+#
+# WHICH TILE VALUES ARE LEGAL IS STILL NOT A FREE CHOICE -- the gate is what
+# enforces it now instead of a comment. Measured per kernel over 20 random
+# inputs at the production shapes (opt/mhc_0908/logs/bitexact_prod.txt):
+#
+#   * a reduction carried in a loop-local accumulator -- the unrolled ``j``
+#     sums in the hpb kernels, ``ct.mma(acc=...)`` across m-tiles in
+#     proj_rms_bwd -- keeps its summation order under any tile shape, because
+#     chunking a sequential accumulation differently does not reorder it.
+#     Tile changes there are bit-exact.
+#   * a reduction written as ``ct.sum`` is a lane-shuffle tree whose shape
+#     follows the *whole* tile shape, not just the length of the reduced axis.
+#     Almost any tile change reassociates it (hpb_bwd's g_hp/g_hr, h_agg_bwd's
+#     gh, proj_rms_fwd's norm, every sinkhorn reduction). ``_ct_hpb_fwd_kernel``
+#     is the only member of the family with no ``ct.sum`` at all.
+#
+# The candidate lists below therefore still only offer values that were
+# measured legal; the gate is the backstop that makes a wrong entry harmless
+# instead of a silent numerics change.
+_MHC_TUNE_PREFIX = "PADDLEFLEET_MHC_TILE"
+
+# One ``tune`` call per (kernel, shape) per process. ``tune`` memoises on the
+# full cache key, but building that key means hashing the machine and toolchain
+# facts, and these launchers run once per layer per step.
+_MHC_TUNED: dict = {}
+
+
+def _mhc_tune(name: str, shape_key, build):
+    """``build()`` -> config, called at most once per (kernel, shape).
+
+    ``build`` is a thunk so the closures a scan needs are not constructed on
+    the hot path. Any failure is reported once and falls back to the shipped
+    tiles: this must never be able to break a launch.
+    """
+    memo_key = (name, shape_key)
+    if memo_key in _MHC_TUNED:
+        return _MHC_TUNED[memo_key] or None
+    try:
+        got = build()
+    except Exception as exc:  # pragma: no cover - environment dependent
+        print(
+            f"[paddlefleet] mHC autotune for {name} failed "
+            f"({type(exc).__name__}: {exc}); using the shipped tiles.",
+            flush=True,
+        )
+        got = None
+    _MHC_TUNED[memo_key] = got if got else False
+    return got or None
+
+
+def _mhc_autotune_call(name, factory, candidates, launch_shape, dtypes,
+                       kernels, make_outputs, launch, **kw):
+    """Thin wrapper so a missing ``paddlefleet.autotune`` is not fatal."""
+    from paddlefleet.autotune import source_hash, tune
+
+    return tune(
+        name=name,
+        factory=factory,
+        candidates=candidates,
+        launch_shape=launch_shape,
+        dtypes=dtypes,
+        src_hash=source_hash(*kernels),
+        make_outputs=make_outputs,
+        launch=launch,
+        env_prefix=_MHC_TUNE_PREFIX,
+        **kw,
+    )
+
+
+_MHC_TILE_OPT_ENV = "PADDLEFLEET_MHC_TILE_OPT"
+_MHC_TILE_OPT_WARNED: list = []
+
+
+def _mhc_live_budget() -> int:
+    """Bytes of live tile a single block may hold, read from the driver.
+
+    Both halves are machine facts: ``regsPerBlock`` words are what ptxas may
+    allocate to one block, and ``sharedMemPerBlockOptin`` is the most shared
+    memory one block may address. A tile shape whose live footprint exceeds the
+    smaller of the two cannot be resident, so it is not offered as a candidate.
+    This is a bound on the candidate set, not a prediction of which candidate
+    wins -- that is measured, because static occupancy has pointed at the wrong
+    winner by 3.7x.
+    """
+    from paddlefleet.autotune import machine_facts
+
+    facts = machine_facts()
+    return min(facts.get("regsPerBlock", 0) * 4,
+               facts.get("sharedMemPerBlockOptin", 0)) or (1 << 20)
+
+
+# A tile row shorter than one 128-byte sector cannot use the transaction it
+# pays for; measured on a sibling kernel, a transpose whose tile row fell below
+# 128 B lost 2.4x. 128 is an invariant of the memory system, in the same
+# category as a 32-lane ballot mask, so it is written down -- unlike anything
+# that scales with the part.
+_SECTOR_BYTES = 128
+
+
+def _mhc_pair_candidates(factory, rows, cols, per_elem_bytes, elem_bytes,
+                         count=8):
+    """``(rows, cols)`` tile candidates around the shipped pair.
+
+    Three rules, each of them there because a simpler generator was measured
+    to miss:
+
+    * walk the row count up in powers of two (x1, x2, x4). Beyond that nothing
+      won on any of these kernels.
+    * at each row count offer three columns: the *widest that still fits*, and
+      two narrow ones (the shipped width over 32 and over 64). Sampling the
+      whole fitting set evenly instead spends slots on tiles 2 and 16 columns
+      wide, measured 2.4x to 32x slower than the winner; offering only the
+      over-64 narrow branch missed one kernel's best tile by 1.7-2.6%
+      (measured: 419.6 us at (2, 128) against 426.8 us at (4, 64), 200
+      launches each, repeated, exclusively-owned card). The landscape is not
+      monotonic in either axis, so the coverage has to be geometric in both.
+    * never go below one sector per tile row.
+
+    ``factory`` is first, so it is the bit-exactness reference and cannot be
+    pushed out by the candidate budget.
+    """
+    budget = _mhc_live_budget()
+    fr, fc = factory
+    floor_c = max(_SECTOR_BYTES // max(elem_bytes, 1), 1)
+    out = [(fr, fc)]
+
+    def widest(r, start):
+        c = start
+        while c >= 1:
+            if cols % c == 0 and r * c * per_elem_bytes <= budget:
+                return c
+            c //= 2
+        return 0
+
+    for mult in (1, 2, 4):
+        r = fr * mult
+        if r > rows or rows % r:
+            continue
+        for start in (fc, max(fc // 32, floor_c), max(fc // 64, floor_c)):
+            c = widest(r, start)
+            if c >= floor_c and (r, c) not in out and len(out) < count:
+                out.append((r, c))
+    return out
+
+
+def _mhc_size_candidates(factory, extent, per_row_bytes, count=8):
+    """One-dimensional tile extents: powers of two around the shipped one.
+
+    Up while the live footprint still fits, and two steps down. Enumerating
+    every divisor instead offers extents of 1 and 2, which are not close to
+    optimal for anything in this family and cost a timing pass each.
+    """
+    budget = _mhc_live_budget()
+    out = [factory]
+    v = factory * 2
+    while v <= extent and extent % v == 0 and v * per_row_bytes <= budget:
+        out.append(v)
+        v *= 2
+    v = factory // 2
+    for _ in range(2):
+        if v >= 1 and extent % v == 0 and v not in out:
+            out.append(v)
+        v //= 2
+    return out[:count]
+
+
+_MHC_OCC_ENV = "PADDLEFLEET_MHC_TILE_OCC"
+
+
+def _mhc_occ_candidates(factory_pair, allowed: bool):
+    """Occupancy-hint candidates, off unless asked for, and starting at 2.
+
+    Starting at 2 rather than at 4 is deliberate: the values that were tried by
+    hand (4/8/12/16) are the ones whose shared-memory demand this family cannot
+    meet, so they were silently dropped, and 2 and 3 -- never tried -- are the
+    only ones with room. They are off by default because the candidate budget
+    is eight per kernel and the tile shapes are worth more (the best hinted
+    configuration measured 1.2% ahead of the best unhinted one, against a 1.9x
+    spread across tiles).
+
+    ``PADDLEFLEET_MHC_TILE_OCC=2,3`` spends two of the eight slots on them.
+    """
+    raw = os.environ.get(_MHC_OCC_ENV, "")
+    if not raw.strip() or not allowed or not factory_pair:
+        return []
+    occs = []
+    for part in raw.replace(";", ",").split(","):
+        try:
+            v = int(part)
+        except ValueError:
+            continue
+        if v >= 2:
+            occs.append(v)
+    return [{"TILE_SIZE": factory_pair[0], "TILE_C": factory_pair[1],
+             "OCC": v} for v in occs]
+
+
+def _mhc_cubin_resources():
+    """reg / ntid / smem of the cubin cuTile compiled most recently.
+
+    Read out of cuTile's on-disk JIT cache, which is the only place the
+    compiled artifact is visible from outside the compiler. Returns {} when
+    ``CUDA_TILE_CACHE_DIR`` is not set, in which case a hint cannot be checked
+    for silent reversion and is recorded as unverified rather than assumed
+    good.
+    """
+    import re
+    import sqlite3
+    import subprocess
+    import tempfile
+
+    cache = os.environ.get("CUDA_TILE_CACHE_DIR")
+    if not cache:
+        return {}
+    db = os.path.join(cache, "cache.db")
+    if not os.path.exists(db):
+        return {}
+    conn = sqlite3.connect(db, timeout=10.0)
+    try:
+        row = conn.execute(
+            "SELECT blob FROM cache ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+    if row is None:
+        return {}
+    with tempfile.NamedTemporaryFile(suffix=".cubin", delete=False) as f:
+        f.write(row[0])
+        path = f.name
+    try:
+        out = subprocess.run(
+            ["/usr/local/cuda/bin/cuobjdump", "-res-usage", path],
+            capture_output=True, text=True, timeout=300,
+        ).stdout
+        # ``-res-usage`` gives registers and shared memory but not the thread
+        # count; ``.reqntid`` is only in the ELF, and without it registers
+        # cannot be turned into resident CTAs.
+        elf = subprocess.run(
+            ["/usr/local/cuda/bin/cuobjdump", "-elf", path],
+            capture_output=True, text=True, timeout=300,
+        ).stdout
+    except Exception:
+        return {}
+    finally:
+        os.unlink(path)
+    info = {}
+    for tag, field in (("REG", "reg"), ("SHARED", "smem")):
+        m = re.search(rf"\b{tag}\s*:\s*(\d+)", out)
+        if m:
+            info[field] = int(m.group(1))
+    m = re.search(r"\.reqntid\s+(\d+)", elf)
+    if m:
+        info["ntid"] = int(m.group(1))
+    return info
+
+
+def _mhc_hint_probe(cfg, kernel_for=None):
+    """Did the occupancy hint in ``cfg`` survive compilation?
+
+    Called by the tuner right after the candidate's first launch, so the cubin
+    it asks about exists. ``blocks`` absent means "could not check" -- the
+    tuner keeps the candidate in that case, and the record says so.
+    """
+    occ = int(cfg.get("OCC", 0) or 0)
+    if occ <= 0:
+        return {}
+    info = _mhc_cubin_resources()
+    if not info.get("reg") or not info.get("ntid"):
+        return {"requested": occ,
+                "unverified": "cuTile cubin cache not readable "
+                              "(set CUDA_TILE_CACHE_DIR to enable the check)"}
+    from paddlefleet.autotune import ctas_per_sm
+
+    got = ctas_per_sm(info["reg"], info["ntid"], info.get("smem", 0))
+    return {"requested": occ, "blocks": got["blocks"], "resources": info,
+            "limits": got}
+
+
+def _mhc_tile_opt_retired() -> None:
+    """The previous round's switch no longer selects anything -- say so.
+
+    It installed the four tile shapes that are now candidates for the tuner.
+    Leaving it silently inert would let a launch script keep setting it and
+    believe it still does something.
+    """
+    if _MHC_TILE_OPT_WARNED:
+        return
+    raw = os.environ.get(_MHC_TILE_OPT_ENV)
+    if raw is None or raw.strip().lower() in ("", "0", "false", "off", "no"):
+        return
+    _MHC_TILE_OPT_WARNED.append(True)
+    print(
+        f"[paddlefleet] {_MHC_TILE_OPT_ENV}={raw} is retired and ignored: the "
+        f"four tile shapes it used to install are now candidates that "
+        f"{_MHC_TUNE_PREFIX}_* picks by measurement. To hold a configuration "
+        f"fixed (for an A/B) use "
+        f"{_MHC_TUNE_PREFIX}_PIN_<KERNEL>='TILE_SIZE=2,TILE_C=128'; to keep "
+        f"the shipped tiles use {_MHC_TUNE_PREFIX}_AUTOTUNE=0.",
+        flush=True,
+    )
+
+
+_MHC_HINTED_KERNELS: dict = {}
+
+
+def _mhc_with_occupancy(kernel, occ: int):
+    """``kernel`` recompiled for a target of ``occ`` resident blocks per SM.
+
+    cuTile's ``occupancy`` hint caps registers per thread, which is the only
+    published knob that moves this family off 8 resident warps out of 64. It
+    also rewrites the shared-memory pipeline, which changes instruction order
+    and can therefore reassociate a lane-shuffle reduction -- so it is offered
+    as a *candidate* only where that was measured harmless
+    (``_ct_hpb_fwd_kernel``, 20 + 20 random inputs at occupancy 4/8/12/16:
+    opt/mhc_0908/logs/hints_hpb_fwd.txt, logs/bitexact_extra.txt), and the
+    bit-exactness gate rejects it anywhere it is not. It is silently dropped
+    whenever ``occ * smem_per_block`` exceeds the shared memory an SM has,
+    which is why the candidate set starts at 2 rather than at 4 and why a
+    dropped hint is detected instead of being timed as a distinct
+    configuration.
+
+    Cached: ``replace_hints`` builds a new kernel object, and this is on the
+    per-launch path.
+    """
+    if occ <= 0:
+        return kernel
+    key = (id(kernel), occ)
+    hinted = _MHC_HINTED_KERNELS.get(key)
+    if hinted is None:
+        hinted = kernel.replace_hints(occupancy=occ)
+        _MHC_HINTED_KERNELS[key] = hinted
+    return hinted
 
 # ---------------------------------------------------------------------------
 # Check cuTile availability
@@ -52,6 +405,329 @@ def is_cutile_available() -> bool:
 def _get_cuda_stream():
     """Get current CUDA stream for cuTile launch."""
     return paddle.device.current_stream().stream_base.cuda_stream
+
+
+# ---------------------------------------------------------------------------
+# Register-cap switch (opt/mhc_regs_0908) -- independent of the tile switch
+# ---------------------------------------------------------------------------
+# Six kernels in this family compile to exactly 255 registers/thread and sit at
+# 8 resident warps out of 64. That is not register pressure: cuTile emits
+# ``.reqntid <ntid>`` + ``.minnctapersm 1`` into the PTX and passes ptxas *no*
+# register limit, so ptxas sizes registers for "one CTA per SM is enough" and
+# takes the whole file -- 255 at ntid=256, and exactly 168 at ntid=384
+# (= 65536/384 rounded down to the 8-register granularity), which is the
+# cleanest proof that the number is a budget and not a saturation point.
+# ``-maxrregcount`` cannot change it (ptxas ignores it when the kernel carries
+# launch bounds); the only channel that works is the PTX directive ``.maxnreg``.
+#
+# cuTile's public ``occupancy=k`` does emit ``.maxnreg``, but it also rewrites
+# the shared-memory pipeline, which changes instruction order -- measured NOT
+# bit-exact on hpb_bwd (14288 elements differ at k=2). This switch instead adds
+# ``.maxnreg`` to the PTX cuTile already generated and re-runs the same ptxas
+# command: the PTX body is unchanged, so the arithmetic and every reduction
+# order are unchanged by construction, and 20 input sets (half of them built to
+# expose reassociation) confirm max|diff| == 0 for every cap used here
+# (opt/mhc_regs_0908/logs/bitexact_regs.json).
+#
+# Seeing the PTX at all needs a tileiras copy with a ptxas wrapper next to it,
+# because tileiras resolves ptxas relative to its own /proc/self/exe. That is
+# built on demand under $PADDLEFLEET_MHC_REGCAP_DIR (default /tmp/...). If any
+# of it fails the original kernel is used, so the switch can only be a no-op or
+# a win, never a crash. Default: OFF -- with the variable unset this file
+# behaves exactly as it did before.
+_MHC_REGCAP_ENV = "PADDLEFLEET_MHC_REGCAP"
+
+# Which register count to ask for is NOT written down here, because it is a
+# property of the machine: the whole reason a cap helps is that ptxas was given
+# the register file of one SM to spend on one CTA. What is written down is how
+# many resident CTAs per SM each kernel wants, which is a property of the
+# kernel, and the register budget follows from
+# ``regsPerMultiprocessor / (target_ctas * ntid)`` rounded down to the
+# 8-register granularity -- ``regsPerMultiprocessor`` read from the driver and
+# ``ntid`` read out of the ``.reqntid`` the PTX carries, so neither appears as
+# a literal (paddlefleet.autotune.reg_cap_for_ctas).
+#
+# The three targets below reproduce the three caps that were swept by hand on
+# this machine exactly (65536 regs/SM: 2 CTAs at ntid=256 -> 128, 4 -> 64,
+# 6 at ntid=128 -> 80), and follow the register file to a different number on a
+# machine with a different one. Measured on production shapes, median of 100
+# launches after 20 warmup, card certified idle before and after
+# (opt/mhc_regs_0908/RESULT.md 5):
+#   hpb_bwd       714.8 -> 504.4 us  (1.417x)   2 CTAs/SM, 12.5% -> 25% occ
+#   sinkhorn_fwd   44.4 ->  30.2 us  (1.467x)   4 CTAs/SM, 12.5% -> 50% occ
+#   hpb_fwd       384.0 -> 319.6 us  (1.202x)   6 CTAs/SM, on a *tuned* tile
+#                                               only -- at the shipped
+#                                               (1,4096) every cap spills.
+# Why not autotune the target as well: the cap is bit-exact by construction
+# (same PTX body in, so same arithmetic and same reduction order out), so the
+# gate cannot separate the candidates and the whole cost would be timing. It
+# would be a reasonable extension; it is not done here, and the numbers above
+# are the evidence for these three targets on this machine only.
+#
+# The rest of the family was swept and is slower under any cap at the tiles it
+# runs with (h_agg_bwd, sinkhorn_bwd and h_agg_fwd at the tuned tiles;
+# proj_rms_fwd/bwd because shared memory alone already limits them to one CTA
+# per SM), so they are deliberately absent.
+_MHC_REGCAP_TARGET_CTAS = {"hpb_bwd": 2, "sinkhorn_fwd": 4}
+_MHC_REGCAP_TUNED_TILE_ONLY = {"hpb_fwd": 6}
+
+_MHC_REGCAP_KERNELS: dict = {}
+_MHC_REGCAP_STATE: dict = {}
+
+
+def _mhc_regcap_on() -> bool:
+    """True when the register cap is requested. Default: off."""
+    return os.environ.get(_MHC_REGCAP_ENV, "0").lower() not in (
+        "",
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
+
+def _mhc_regcap_target(name: str, tuned_tile: bool) -> int:
+    """Resident CTAs/SM to size registers for, or 0 for "do not cap".
+
+    ``_MHC_REGCAP_TUNED_TILE_ONLY`` entries only pay off once the tile shape
+    has moved off the shipped one (at the shipped tile every cap spills), so
+    they stay at 0 until the tuner has actually chosen a different tile.
+    """
+    env = f"{_MHC_REGCAP_ENV}_CTAS_{name.upper()}"
+    raw = os.environ.get(env)
+    if raw is not None:
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+    if name in _MHC_REGCAP_TUNED_TILE_ONLY:
+        return _MHC_REGCAP_TUNED_TILE_ONLY[name] if tuned_tile else 0
+    return _MHC_REGCAP_TARGET_CTAS.get(name, 0)
+
+
+def _mhc_regcap_toolkit():
+    """Build (once) a toolkit layout whose ptxas is a PTX-rewriting wrapper.
+
+    Returns the path of the tileiras copy to drive, or None if it cannot be
+    built -- callers must treat None as "leave the kernel alone".
+    """
+    if "toolkit" in _MHC_REGCAP_STATE:
+        return _MHC_REGCAP_STATE["toolkit"]
+    _MHC_REGCAP_STATE["toolkit"] = None
+    try:
+        import shutil
+
+        real = shutil.which("tileiras") or "/usr/local/cuda/bin/tileiras"
+        real = os.path.realpath(real)
+        root = os.path.dirname(os.path.dirname(real))
+        base = os.environ.get(
+            f"{_MHC_REGCAP_ENV}_DIR",
+            os.path.join("/tmp", f"pdc_mhc_regcap_{os.getuid()}"),
+        )
+        bin_dir = os.path.join(base, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        tileiras = os.path.join(bin_dir, "tileiras")
+        if not os.path.exists(tileiras):
+            tmp = tileiras + f".{os.getpid()}"
+            shutil.copy2(real, tmp)
+            os.replace(tmp, tileiras)
+        for link in ("nvvm", "lib64"):
+            dst = os.path.join(base, link)
+            if not os.path.exists(dst):
+                try:
+                    os.symlink(os.path.join(root, link), dst)
+                except FileExistsError:
+                    pass
+        ptxas = os.path.join(bin_dir, "ptxas")
+        if not os.path.exists(ptxas):
+            real_ptxas = os.path.join(root, "bin", "ptxas")
+            tmp = ptxas + f".{os.getpid()}"
+            with open(tmp, "w") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    "# Written by paddlefleet fused_mhc_kernels "
+                    "(PADDLEFLEET_MHC_REGCAP).\n"
+                    "# Keeps the PTX tileiras generated plus its argv, then\n"
+                    "# runs the real ptxas unchanged.\n"
+                    'OUT="${PTX_CAPTURE_DIR:-/tmp}"\n'
+                    'mkdir -p "$OUT"\n'
+                    'for a in "$@"; do\n'
+                    '  case "$a" in\n'
+                    '    *.ptx) cp "$a" "$OUT/in.ptx" ;;\n'
+                    '    --nv-host=*) cp "${a#--nv-host=}" "$OUT/nvhost.o"'
+                    " 2>/dev/null ;;\n"
+                    "  esac\n"
+                    "done\n"
+                    'printf "%s\\n" "$@" > "$OUT/argv.txt"\n'
+                    f'exec {real_ptxas} "$@"\n'
+                )
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, ptxas)
+        _MHC_REGCAP_STATE["toolkit"] = tileiras
+        _MHC_REGCAP_STATE["ptxas"] = os.path.join(root, "bin", "ptxas")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        print(
+            f"[paddlefleet] {_MHC_REGCAP_ENV}: cannot build the ptxas wrapper "
+            f"({exc}); running the uncapped kernels.",
+            flush=True,
+        )
+    return _MHC_REGCAP_STATE["toolkit"]
+
+
+def _mhc_regcap_cubin(bytecode: bytes, target_ctas: int, arch: str) -> bytes:
+    """TileIR bytecode -> PTX -> ``+ .maxnreg`` -> ptxas -> cubin.
+
+    The cap itself is computed here and nowhere else, because this is the first
+    point at which both halves of it are available: ``ntid`` from the
+    ``.reqntid`` the PTX carries, and ``regsPerMultiprocessor`` from the
+    driver. Writing the product down instead would be writing down one
+    machine's register file.
+    """
+    import hashlib
+    import re
+    import subprocess
+    import tempfile
+
+    from paddlefleet.autotune import machine_facts, reg_cap_for_ctas
+
+    tileiras = _mhc_regcap_toolkit()
+    if tileiras is None:
+        raise RuntimeError("no ptxas wrapper")
+    base = os.path.dirname(os.path.dirname(tileiras))
+    cache = os.path.join(base, "cubins")
+    os.makedirs(cache, exist_ok=True)
+    key = hashlib.sha1(bytes(bytecode)).hexdigest()[:16]
+    facts = machine_facts()
+    memo = os.path.join(
+        cache,
+        f"{key}_ctas{target_ctas}_r{facts.get('regsPerMultiprocessor', 0)}"
+        f"_{arch}.cubin",
+    )
+    if os.path.exists(memo):
+        with open(memo, "rb") as f:
+            return f.read()
+
+    work = tempfile.mkdtemp(prefix="mhc_regcap_")
+    bc = os.path.join(work, "k.tileirbc")
+    with open(bc, "wb") as f:
+        f.write(bytes(bytecode))
+    env = dict(os.environ, PTX_CAPTURE_DIR=work)
+    r = subprocess.run(
+        [tileiras, bc, "-o", os.path.join(work, "t.cubin"),
+         "--gpu-name", arch, "-O3", "--lineinfo"],
+        env=env, capture_output=True, text=True, timeout=3600,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"tileiras: {r.stderr[-200:]}")
+    with open(os.path.join(work, "in.ptx")) as f:
+        ptx = f.read()
+    if ".maxnreg" in ptx:
+        raise RuntimeError("PTX already carries a register cap")
+    ntid_m = re.search(r"\.reqntid\s+(\d+)", ptx)
+    if ntid_m is None:
+        raise RuntimeError("no .reqntid to size the register budget against")
+    ntid = int(ntid_m.group(1))
+    cap = reg_cap_for_ctas(ntid, target_ctas, facts)
+    if cap <= 0:
+        raise RuntimeError(
+            f"{target_ctas} CTAs/SM at ntid={ntid} needs no cap on this "
+            f"machine ({facts.get('regsPerMultiprocessor')} regs/SM)"
+        )
+    m = re.search(r"(\.minnctapersm\s+\d+\s*\n)", ptx) or re.search(
+        r"(\.reqntid\s+\d+\s*\n)", ptx)
+    if m is None:
+        raise RuntimeError("no launch bounds to anchor .maxnreg on")
+    capped = os.path.join(work, "capped.ptx")
+    with open(capped, "w") as f:
+        f.write(ptx[: m.end()] + f".maxnreg {cap}\n" + ptx[m.end():])
+
+    with open(os.path.join(work, "argv.txt")) as f:
+        argv = [a for a in f.read().split("\n") if a]
+    out = os.path.join(work, "capped.cubin")
+    cmd, skip = [_MHC_REGCAP_STATE["ptxas"]], False
+    for a in argv:
+        if skip:
+            skip = False
+            continue
+        if a.endswith(".ptx"):
+            cmd.append(capped)
+        elif a == "-o":
+            cmd.extend([a, out])
+            skip = True
+        elif a.startswith("--nv-host="):
+            cmd.append("--nv-host=" + os.path.join(work, "nvhost.o"))
+        else:
+            cmd.append(a)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if r.returncode != 0:
+        raise RuntimeError(f"ptxas at cap={cap}: {r.stderr[-200:]}")
+    with open(out, "rb") as f:
+        blob = f.read()
+    tmp = memo + f".{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(blob)
+    os.replace(tmp, memo)
+    return blob
+
+
+def _mhc_regcap_class():
+    """The ``ct.kernel`` subclass that rebuilds its cubin with a cap."""
+    cls = _MHC_REGCAP_STATE.get("class")
+    if cls is not None:
+        return cls
+
+    class _MhcRegCapKernel(ct.kernel):
+        _mhc_target_ctas = 0
+
+        def _compile(self, signature, context):
+            from cuda.tile._compile import compile_tile, get_sm_arch
+
+            arch = get_sm_arch()
+            res = compile_tile(
+                self._annotated_function, (signature,), arch,
+                self._compiler_options, context,
+                return_bytecode=True, return_cubin=False,
+            )
+            [sig] = res.kernel_signatures
+            cubin = _mhc_regcap_cubin(res.bytecode, self._mhc_target_ctas,
+                                      arch)
+            return cubin, sig.symbol, None, []
+
+    _MHC_REGCAP_STATE["class"] = _MhcRegCapKernel
+    return _MhcRegCapKernel
+
+
+def _mhc_reg_capped(kernel, name: str, tuned_tile: bool = False):
+    """``kernel``, or a bit-identical copy of it sized for N CTAs per SM.
+
+    Returns ``kernel`` itself unless the switch is on, a target is configured
+    for ``name``, and the rebuild succeeds -- so this is a no-op by default and
+    degrades to a no-op on any failure. Cached: this is on the launch path.
+    """
+    if not _mhc_regcap_on():
+        return kernel
+    ctas = _mhc_regcap_target(name, tuned_tile)
+    if ctas <= 0:
+        return kernel
+    key = (name, ctas)
+    got = _MHC_REGCAP_KERNELS.get(key)
+    if got is None:
+        try:
+            import dataclasses
+
+            opts = dataclasses.asdict(kernel._compiler_options)
+            capped = _mhc_regcap_class()(kernel._pyfunc, **opts)
+            capped._mhc_target_ctas = ctas
+            got = capped
+        except Exception as exc:
+            print(
+                f"[paddlefleet] {_MHC_REGCAP_ENV}: {name} target {ctas} "
+                f"CTAs/SM not applied ({exc}); running the uncapped kernel.",
+                flush=True,
+            )
+            got = kernel
+        _MHC_REGCAP_KERNELS[key] = got
+    return got
 
 
 # ============================================================================
@@ -181,7 +857,7 @@ if _CUTILE_AVAILABLE:
         ct.launch(
             _get_cuda_stream(),
             (math.ceil(N_batch / TILE_SIZE), 1, 1),
-            _ct_sinkhorn_fwd_kernel,
+            _mhc_reg_capped(_ct_sinkhorn_fwd_kernel, "sinkhorn_fwd"),
             (
                 input_logits.reshape([N_batch, hc, hc]),
                 out,
@@ -203,8 +879,7 @@ if _CUTILE_AVAILABLE:
         original_shape = grad_output.shape
         hc = original_shape[-1]
         N_batch = grad_output.size // (hc * hc)
-        # Optimized: TILE_SIZE=64 is fastest for bwd (0.158ms vs 0.234ms@128)
-        TILE_SIZE = math.gcd(N_batch, 64)
+        SHIPPED_TS = math.gcd(N_batch, 64)
         ws_M = paddle.empty(
             shape=[N_batch * 2 * num_iterations, hc, hc], dtype="float32"
         )
@@ -214,6 +889,53 @@ if _CUTILE_AVAILABLE:
         ws_cs = paddle.empty(
             shape=[N_batch * num_iterations, 1, hc], dtype="float32"
         )
+        # opt/mhc_0908: every reduction in this kernel is a ``ct.sum`` and they
+        # are chained 40 deep, so TILE_SIZE is a numerics knob almost
+        # everywhere: measured exact only at 128 (16 and 32 differ, up to 2e4
+        # fp32 ULP on 82% of the elements -- logs/bitexact_prod.txt). That was
+        # a hand-measured whitelist of one value on one machine; the gate now
+        # rediscovers it, so the candidate set is simply every extent that
+        # divides and fits and everything that reassociates is thrown out on
+        # bytes.
+        _mhc_tile_opt_retired()
+
+        def _tune_sinkhorn_bwd():
+            def make_outputs():
+                return (paddle.empty(shape=[N_batch, hc, hc],
+                                     dtype=grad_output.dtype),)
+
+            def do_launch(cfg, outs):
+                ts = cfg["TILE_SIZE"]
+                ct.launch(
+                    _get_cuda_stream(),
+                    (math.ceil(N_batch / ts), 1, 1),
+                    _ct_sinkhorn_bwd_kernel,
+                    (
+                        grad_output.reshape([N_batch, hc, hc]),
+                        M_init.reshape([N_batch, hc, hc]),
+                        outs[0], ws_M, ws_rs, ws_cs, eps, hc,
+                        num_iterations, ts,
+                    ),
+                )
+
+            return _mhc_autotune_call(
+                name="mhc.sinkhorn_bwd",
+                factory={"TILE_SIZE": SHIPPED_TS},
+                candidates=[
+                    {"TILE_SIZE": v} for v in _mhc_size_candidates(
+                        SHIPPED_TS, N_batch, hc * hc * 4 * 4)
+                ],
+                launch_shape=(N_batch, hc, num_iterations),
+                dtypes=(grad_output.dtype, M_init.dtype),
+                kernels=(_ct_sinkhorn_bwd_kernel,),
+                make_outputs=make_outputs,
+                launch=do_launch,
+            )
+
+        cfg = _mhc_tune("mhc.sinkhorn_bwd",
+                        (N_batch, hc, num_iterations, str(grad_output.dtype)),
+                        _tune_sinkhorn_bwd)
+        TILE_SIZE = cfg["TILE_SIZE"] if cfg else SHIPPED_TS
         grad_input = paddle.empty(
             shape=[N_batch, hc, hc], dtype=grad_output.dtype
         )
@@ -682,10 +1404,51 @@ if _CUTILE_AVAILABLE:
     ) -> Tensor:
         s, b, n, C = x.shape
         sb = s * b
-        TILE_SIZE = math.gcd(sb, 4)
-        TILE_C = math.gcd(C, 1024)
+        SHIPPED = (math.gcd(sb, 4), math.gcd(C, 1024))
+        # opt/mhc_0908: TILE_SIZE is free here (the reduction is over ``n``,
+        # which always sits whole inside the tile), and so is TILE_C except for
+        # 128, which reassociates the ``ct.sum`` over ``n``: measured exact for
+        # TILE_C in {4096, 2048, 1024, 512, 256} and for TILE_SIZE in
+        # {1, 2, 4, 8, 16, 32}, and DIFF (2-4 bf16 ULP on 3e-5 of the elements)
+        # at TILE_C=128 -- logs/bitexact_prod.txt. That whitelist is no longer
+        # what protects the numerics; the gate is, and it re-derives the same
+        # exclusion on whatever machine it runs on.
+        _mhc_tile_opt_retired()
         # ``out`` follows x either way: under fuse_cast x is already the dtype
         # the downstream layernorm wants, so no override is needed.
+
+        def _tune_h_agg_fwd():
+            def make_outputs():
+                return (paddle.empty(shape=[sb, C], dtype=x.dtype),)
+
+            def do_launch(cfg, outs):
+                tm, tc = cfg["TILE_SIZE"], cfg["TILE_C"]
+                ct.launch(
+                    _get_cuda_stream(),
+                    (math.ceil(sb / tm),),
+                    _ct_h_agg_fwd_kernel,
+                    (x.reshape([sb, n, C]), h_pre.reshape([sb, n]), outs[0],
+                     n, tm, tc, fuse_cast),
+                )
+
+            pairs = _mhc_pair_candidates(
+                SHIPPED, sb, C, n * 4, x.element_size())
+            return _mhc_autotune_call(
+                name="mhc.h_agg_fwd",
+                factory={"TILE_SIZE": SHIPPED[0], "TILE_C": SHIPPED[1]},
+                candidates=[{"TILE_SIZE": r, "TILE_C": c} for r, c in pairs],
+                launch_shape=(sb, n, C),
+                dtypes=(x.dtype, h_pre.dtype, bool(fuse_cast)),
+                kernels=(_ct_h_agg_fwd_kernel,),
+                make_outputs=make_outputs,
+                launch=do_launch,
+            )
+
+        cfg = _mhc_tune(
+            "mhc.h_agg_fwd",
+            (sb, n, C, str(x.dtype), bool(fuse_cast)), _tune_h_agg_fwd)
+        TILE_SIZE = cfg["TILE_SIZE"] if cfg else SHIPPED[0]
+        TILE_C = cfg["TILE_C"] if cfg else SHIPPED[1]
         out = paddle.empty(shape=[sb, C], dtype=x.dtype)
         ct.launch(
             _get_cuda_stream(),
@@ -711,10 +1474,56 @@ if _CUTILE_AVAILABLE:
     ) -> tuple[Tensor, Tensor]:
         s, b, n, C = x.shape
         sb = s * b
-        # Optimized: TM=2, TC=min(C,4096) is fastest for bwd (0.185ms vs 0.190ms@TM=4/TC=1024)
+        # opt/mhc_0908: ``gh`` reduces over C with ``ct.sum``, so TILE_C is
+        # pinned -- every smaller value reassociates it. TILE_M is exact only
+        # for {1, 2, 4}; 8 and 16 change the tile shape enough to reassociate
+        # the same sum (logs/bitexact_prod.txt). TILE_C is deliberately not a
+        # candidate: it is not that the gate would let it through, it is that
+        # there is nothing to gain by asking.
         TILE_C = min(C, 4096) if C <= 4096 else math.gcd(C, 1024)
-        TILE_M = math.gcd(sb, 2)
+        SHIPPED_TM = math.gcd(sb, 2)
+        _mhc_tile_opt_retired()
+
+        def _tune_h_agg_bwd():
+            def make_outputs():
+                return (
+                    paddle.empty(shape=[sb, n, C], dtype=x.dtype),
+                    paddle.empty(shape=[sb, n],
+                                 dtype=h_pre.dtype if fuse_cast else x.dtype),
+                )
+
+            def do_launch(cfg, outs):
+                tm = cfg["TILE_M"]
+                ct.launch(
+                    _get_cuda_stream(),
+                    (math.ceil(sb / tm),),
+                    _ct_h_agg_bwd_kernel,
+                    (grad_output.reshape([sb, C]), x.reshape([sb, n, C]),
+                     h_pre.reshape([sb, n]), outs[0], outs[1], n, tm, TILE_C,
+                     fuse_cast),
+                )
+
+            return _mhc_autotune_call(
+                name="mhc.h_agg_bwd",
+                factory={"TILE_M": SHIPPED_TM},
+                candidates=[
+                    {"TILE_M": v} for v in _mhc_size_candidates(
+                        SHIPPED_TM, sb, n * TILE_C * 2)
+                ],
+                launch_shape=(sb, n, C, TILE_C),
+                dtypes=(grad_output.dtype, x.dtype, h_pre.dtype,
+                        bool(fuse_cast)),
+                kernels=(_ct_h_agg_bwd_kernel,),
+                make_outputs=make_outputs,
+                launch=do_launch,
+            )
+
+        cfg = _mhc_tune(
+            "mhc.h_agg_bwd",
+            (sb, n, C, str(x.dtype), bool(fuse_cast)), _tune_h_agg_bwd)
+        TILE_M = cfg["TILE_M"] if cfg else SHIPPED_TM
         gx = paddle.empty(shape=[sb, n, C], dtype=x.dtype)
+
         # gh is the gradient of h_pre, which stays fp32 under fuse_cast even
         # though x does not, so it cannot follow x's dtype there.
         gh = paddle.empty(
@@ -1074,16 +1883,47 @@ if _CUTILE_AVAILABLE:
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
-        # Optimized: use largest power-of-2 tile that divides C, up to 4096
-        # cuTile requires TILE_C to be a power of 2
-        TILE_C = (
+        # Shipped: the largest power-of-2 tile that divides C, up to 4096
+        # (cuTile requires TILE_C to be a power of 2), one row at a time.
+        SHIPPED = (
+            math.gcd(sb, 1),
             math.gcd(C, 4096)
             if C % 4096 == 0
             else math.gcd(C, 2048)
             if C % 2048 == 0
-            else math.gcd(C, 1024)
+            else math.gcd(C, 1024),
         )
-        TILE_SIZE = math.gcd(sb, 1)
+        # opt/mhc_0908: this kernel holds two (TILE_SIZE, n, TILE_C) fp32 tiles
+        # at once -- the accumulator and the in-register widening of ``orig``.
+        # At the shipped (1, 4096) that is 2 x 16384 fp32 over 128 threads =
+        # 254 registers/thread, i.e. 2 blocks and 8 warps per SM (12.5%), which
+        # is why the kernel only reaches ~1.7 TB/s while moving exactly its
+        # compulsory bytes. Smaller tiles lift that ceiling, but NOT
+        # MONOTONICALLY, which is the reason this is measured rather than
+        # derived. Measured on an exclusively-owned card, median of 100
+        # launches at one production shape (16384 x 4 x 4096):
+        #
+        #   (1, 4096) shipped  740.7 us  1633 GB/s  23.5% of peak  254 reg
+        #   (2,  128)          383.7 us  3152 GB/s  45.4%          109 reg
+        #   (4,   64)          394.9 us  3062 GB/s  44.1%          109 reg
+        #   (1, 1024)          431.6 us  2802 GB/s  40.4%          255 reg
+        #   (1,  256)          448.0 us  2699 GB/s  38.9%          114 reg
+        #   (1,  128)          883.1 us  1369 GB/s  19.7%          141 reg
+        #   (1,   64)          761.7 us  1587 GB/s  22.9%           74 reg
+        #                      ^ 37.5% occupancy and still slower than shipped
+        #
+        # Those numbers are here as the record of *why* this is a tuned
+        # quantity, not as values to install: they are one machine and one
+        # shape. The tuner re-measures.
+        #
+        # Bit-exact for every tile shape tested, including under catastrophic
+        # cancellation: the only reduction here is the unrolled ``for j`` sum,
+        # which is a loop-local accumulator and therefore tile-invariant.
+        # 20 + 20 random inputs x 11 configs, 0 differing elements
+        # (opt/mhc_0908/logs/bitexact_prod.txt, logs/bitexact_extra.txt). This
+        # is the one kernel in the family with no ``ct.sum`` at all, which is
+        # also why it is the only one allowed to offer occupancy candidates.
+        _mhc_tile_opt_retired()
         # ``fuse_cast`` means the caller skipped the fp32 widening it would
         # otherwise have done, so the kernel widens in-register and the result
         # comes back in the residual dtype. This cannot be sniffed
@@ -1101,6 +1941,80 @@ if _CUTILE_AVAILABLE:
         # reduction -- worth revisiting only for a bias-carrying config.
         fuse_cast = fuse_cast and bias is None
         out_dtype = original_residual.dtype if fuse_cast else h_res.dtype
+
+        def _tune_hpb_fwd():
+            def make_outputs():
+                return (paddle.empty(shape=[sb, n, C], dtype=out_dtype),)
+
+            def kernel_for(cfg):
+                # opt/mhc_regs_0908: the ``.maxnreg`` rebuild only pays off
+                # once the tile has moved off the shipped one (at (1, 4096)
+                # every cap spills), so the tuner's own choice decides whether
+                # it is applied -- not a separate switch that could disagree
+                # with the tile in force.
+                k = _mhc_with_occupancy(_ct_hpb_fwd_kernel, cfg.get("OCC", 0))
+                tuned = (cfg["TILE_SIZE"], cfg["TILE_C"]) != SHIPPED
+                return _mhc_reg_capped(k, "hpb_fwd", tuned_tile=tuned)
+
+            def do_launch(cfg, outs):
+                ts, tc = cfg["TILE_SIZE"], cfg["TILE_C"]
+                if bias is not None:
+                    ct.launch(
+                        _get_cuda_stream(), (math.ceil(sb / ts),),
+                        _ct_hpb_fwd_bias_kernel,
+                        (h_res.reshape([sb, n, n]),
+                         original_residual.reshape([sb, n, C]),
+                         h_post.reshape([sb, n]), x.reshape([sb, C]),
+                         bias.detach(), outs[0], n, tc, ts),
+                    )
+                else:
+                    ct.launch(
+                        _get_cuda_stream(), (math.ceil(sb / ts),),
+                        kernel_for(cfg),
+                        (h_res.reshape([sb, n, n]),
+                         original_residual.reshape([sb, n, C]),
+                         h_post.reshape([sb, n]), x.reshape([sb, C]),
+                         outs[0], n, tc, ts, fuse_cast),
+                    )
+
+            # The occupancy candidates, if any were asked for, take their slots
+            # out of the eight rather than being appended past the budget --
+            # otherwise they would be silently dropped by the truncation and
+            # look as though they had been tried.
+            occ = _mhc_occ_candidates(SHIPPED, bias is None)
+            pairs = _mhc_pair_candidates(
+                SHIPPED, sb, C, n * 4 * 2,
+                original_residual.element_size(), count=8 - len(occ))
+            cands = [{"TILE_SIZE": r, "TILE_C": c, "OCC": 0} for r, c in pairs]
+            cands += occ
+            return _mhc_autotune_call(
+                name="mhc.hpb_fwd",
+                factory={"TILE_SIZE": SHIPPED[0], "TILE_C": SHIPPED[1],
+                         "OCC": 0},
+                candidates=cands,
+                launch_shape=(sb, n, C),
+                dtypes=(h_res.dtype, original_residual.dtype, h_post.dtype,
+                        x.dtype, out_dtype, bias is not None,
+                        bool(fuse_cast)),
+                kernels=(_ct_hpb_fwd_kernel, _ct_hpb_fwd_bias_kernel),
+                make_outputs=make_outputs,
+                launch=do_launch,
+                hint_probe=lambda cfg: _mhc_hint_probe(cfg, kernel_for),
+            )
+
+        cfg = _mhc_tune(
+            "mhc.hpb_fwd",
+            (sb, n, C, str(out_dtype), bias is not None, bool(fuse_cast)),
+            _tune_hpb_fwd,
+        )
+        if cfg is None:
+            cfg = {"TILE_SIZE": SHIPPED[0], "TILE_C": SHIPPED[1], "OCC": 0}
+        TILE_SIZE, TILE_C = cfg["TILE_SIZE"], cfg["TILE_C"]
+        fwd_kernel = _mhc_with_occupancy(_ct_hpb_fwd_kernel, cfg.get("OCC", 0))
+        fwd_kernel = _mhc_reg_capped(
+            fwd_kernel, "hpb_fwd",
+            tuned_tile=(TILE_SIZE, TILE_C) != SHIPPED,
+        )
         out = paddle.empty(shape=[sb, n, C], dtype=out_dtype)
         grid = (math.ceil(sb / TILE_SIZE),)
         if bias is not None:
@@ -1124,7 +2038,7 @@ if _CUTILE_AVAILABLE:
             ct.launch(
                 _get_cuda_stream(),
                 grid,
-                _ct_hpb_fwd_kernel,
+                fwd_kernel,
                 (
                     h_res.reshape([sb, n, n]),
                     original_residual.reshape([sb, n, C]),
@@ -1193,7 +2107,7 @@ if _CUTILE_AVAILABLE:
             ct.launch(
                 _get_cuda_stream(),
                 grid,
-                _ct_hpb_bwd_kernel,
+                _mhc_reg_capped(_ct_hpb_bwd_kernel, "hpb_bwd"),
                 (
                     grad_output.reshape([sb, n, C]),
                     h_res.reshape([sb, n, n]),
@@ -1550,6 +2464,27 @@ if _CUTILE_AVAILABLE:
         if K >= 8192:
             # Optimized: TM=64, TK=128 is fastest (0.186ms vs 0.208ms@128/128)
             TILE_SIZE_M, TILE_SIZE_K = 64, 128
+            # opt/mhc_0908: the grid here is one block per K tile, so
+            # TILE_SIZE_K=128 with K=n*hidden_size=16384 launches 128 blocks on
+            # a 148-SM part -- 20 SMs stay empty for the whole kernel, and each
+            # block then walks all M/TILE_SIZE_M m-tiles serially. Filling the
+            # part with TK=64 looked like the obvious fix and is 1.54x SLOWER
+            # (432.4 us vs 281.6 at TM=64), as is every other legal
+            # combination: the shipped (64, 128) is the best of the eight
+            # measured. So the defaults here are the shipped values and this is
+            # a knob only.
+            #
+            # Bit-exact for every (TM, TK) tested: ``DB`` accumulates across
+            # m-tiles in a single ``ct.mma(acc=...)`` carried by the loop, and
+            # re-chunking a sequential accumulation does not reorder it. 20
+            # random inputs at M=256 plus 20 at M=4096 with operands spread
+            # over 12 decades, 0 differing elements (logs/bitexact_prod.txt,
+            # logs/bitexact_extra.txt).
+            # logs/bitexact_extra.txt). Not routed through the tuner: the
+            # shipped pair already won its sweep and there is no second
+            # candidate worth eight timing passes in the first step. The knob
+            # that used to sit here defaulted to the shipped values, so
+            # removing it changes nothing.
             grid = (math.ceil(K / TILE_SIZE_K), 1)
             ct.launch(
                 _get_cuda_stream(),

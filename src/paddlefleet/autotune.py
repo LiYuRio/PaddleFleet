@@ -1,0 +1,839 @@
+# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Launch-parameter autotuning with a bit-exactness gate.
+
+Why this exists instead of tuned constants
+------------------------------------------
+A launch configuration swept on one machine at one shape is not portable. The
+same six hardcoded configurations that made a kernel family faster on the
+machine they were swept on were "effective but harmful" on another generation
+(the 256x256 tile spilled 3940 B where 128x128 spilled 312 B, and resident CTAs
+per SM went 2 -> 1), and had to be reverted wholesale. So no launch parameter
+below is written down: candidate *bounds* come from
+``cuDeviceGetAttribute``, and which candidate wins is measured here.
+
+Two rules that the order of operations encodes
+----------------------------------------------
+1. **The bit-exactness gate runs before timing, never after.** A candidate is
+   compared byte-for-byte (not with a tolerance) against the factory
+   configuration's output, and a single differing byte drops it however fast it
+   is. This is what makes "autotuned" compatible with "numerically lossless":
+   correctness is not something a human re-verifies per machine.
+
+   It also catches cases that cannot be reasoned about. Reduction order is
+   usually predictable from the source -- a loop-carried accumulator survives
+   any tiling, a lane-shuffle tree (``ct.sum``) does not -- but library calls
+   are not: a cuBLASLt algorithm choice is not a pure function of its operands
+   (merely having another GEMM live in the process changes it), so "this
+   rewrite cannot reorder the reduction" has been measured false. Only a
+   measurement can decide those.
+
+2. **Selection is measured, never proxied by a static metric.** Static
+   occupancy and register/spill counts have both pointed at the wrong winner:
+   a configuration with 100% static occupancy and zero spill ran 3.7x slower
+   than the winner (which sat at 25%), and a cleaner one (37 regs, 0 spill)
+   lost by 4% to a dirtier one. Issue rate can even be inverted -- the faster
+   variant issued *more*. Static numbers are used here only to bound the
+   candidate set and to detect a silently dropped hint.
+
+Three entry points
+------------------
+==============================  =========================================
+``<PREFIX>_AUTOTUNE=0``         always the factory config; no cache, no scan
+``<PREFIX>_PIN[_<NAME>]=k=v``   force one config; no cache, no scan
+default                         cache lookup; on a miss rank 0 scans, the
+                                other ranks wait for the cache
+==============================  =========================================
+
+``_PIN`` is not a debugging nicety. Autotuning and "the A/B differs in exactly
+one variable" are in direct conflict: if a configuration is allowed to drift
+per machine and per shape, an end-to-end comparison silently contains more
+than the change under test. Pinning both sides is the only way to attribute a
+difference. (A tile change that landed *between* the two sides of one A/B once
+produced a published-then-retracted conclusion.)
+
+Who scans
+---------
+Rank 0 scans under a file lock and publishes; every other rank waits for the
+file and, on timeout, falls back to the factory configuration with a warning.
+Other ranks must never scan: N ranks timing the same kernel on N GPUs of one
+node contend for the same SMs, and a single dirty card has been measured to
+slow a tightly-coupled job 2.1x -- the timings would be noise.
+
+The cache is a directory of one JSON file per key, written to a temporary name
+and ``os.replace``d into place, because a reader on another node that catches a
+half-written file has no way to tell. Point ``PADDLEFLEET_AUTOTUNE_CACHE_DIR``
+at shared storage so that every rank sees what rank 0 published.
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+import statistics
+import subprocess
+import sys
+import time
+import warnings
+
+CACHE_LAYOUT = "v1"
+
+_FALSEY = ("", "0", "false", "off", "no")
+
+
+def _env_on(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in _FALSEY
+
+
+# ---------------------------------------------------------------------------
+# Machine facts -- the only source. No caller may write one of these down.
+# ---------------------------------------------------------------------------
+# Every one of these numbers changes with the GPU, and a stale one does not
+# raise: it silently sizes a tile or a register budget for the wrong machine.
+# So they are read from the driver on the device that is actually in use, and
+# they go into the cache key (below) so that a cache built elsewhere cannot be
+# applied here.
+_MACHINE_CACHE: dict = {}
+
+_ATTRS = {
+    "multiProcessorCount": "MULTIPROCESSOR_COUNT",
+    "regsPerMultiprocessor": "MAX_REGISTERS_PER_MULTIPROCESSOR",
+    "regsPerBlock": "MAX_REGISTERS_PER_BLOCK",
+    "maxThreadsPerMultiProcessor": "MAX_THREADS_PER_MULTIPROCESSOR",
+    "maxThreadsPerBlock": "MAX_THREADS_PER_BLOCK",
+    "sharedMemPerMultiprocessor": "MAX_SHARED_MEMORY_PER_MULTIPROCESSOR",
+    "sharedMemPerBlockOptin": "MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
+    "maxBlocksPerMultiProcessor": "MAX_BLOCKS_PER_MULTIPROCESSOR",
+    "warpSize": "WARP_SIZE",
+    "major": "COMPUTE_CAPABILITY_MAJOR",
+    "minor": "COMPUTE_CAPABILITY_MINOR",
+}
+
+
+def _current_device() -> int:
+    try:
+        import paddle
+
+        place = paddle.framework._current_expected_place()
+        return int(getattr(place, "gpu_device_id", lambda: 0)())
+    except Exception:
+        return 0
+
+
+def machine_facts(device: int | None = None) -> dict:
+    """``cuDeviceGetAttribute`` for every quantity the tuner may use.
+
+    Includes ``uuid`` for the log only -- it is deliberately *not* part of the
+    cache key, or two identical GPUs in one job could not share a cache entry.
+    """
+    dev = _current_device() if device is None else device
+    hit = _MACHINE_CACHE.get(dev)
+    if hit is not None:
+        return hit
+    facts: dict = {}
+    try:
+        from cuda.bindings import driver as drv
+
+        (err,) = (drv.cuInit(0),)
+        (err, handle) = drv.cuDeviceGet(dev)
+        for name, attr in _ATTRS.items():
+            code = getattr(drv.CUdevice_attribute,
+                           "CU_DEVICE_ATTRIBUTE_" + attr)
+            err, val = drv.cuDeviceGetAttribute(code, handle)
+            if int(err) == 0:
+                facts[name] = int(val)
+        err, uuid = drv.cuDeviceGetUuid(handle)
+        if int(err) == 0:
+            facts["uuid"] = bytes(uuid.bytes).hex()
+    except Exception as exc:  # pragma: no cover - environment dependent
+        facts["error"] = f"{type(exc).__name__}: {exc}"
+    if "major" in facts:
+        facts["arch"] = f"{facts['major']}.{facts['minor']}"
+    _MACHINE_CACHE[dev] = facts
+    return facts
+
+
+def _arch(facts: dict) -> str:
+    return facts.get("arch", "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Toolchain facts -- in the key because the *behaviour being tuned around* is
+# partly the toolchain's.
+# ---------------------------------------------------------------------------
+# Concretely: cuTile emits ``.reqntid`` + ``.minnctapersm 1`` and passes ptxas
+# no register budget, so ptxas sizes registers for one CTA per SM and takes the
+# whole file (exactly 255 at ntid=256, exactly 168 at ntid=384 = 65536/384
+# rounded down to the 8-register granularity). Every register-cap decision in
+# this repository exists because of that, and a toolchain upgrade can remove
+# it. A cache entry from before the upgrade would then be tuned for a machine
+# that no longer exists.
+_TOOLCHAIN_CACHE: dict = {}
+
+
+def toolchain_facts() -> dict:
+    if _TOOLCHAIN_CACHE:
+        return _TOOLCHAIN_CACHE
+    out: dict = {"python": "%d.%d" % sys.version_info[:2]}
+    for mod, key in (("cuda.tile", "cuda_tile"), ("triton", "triton"),
+                     ("paddle", "paddle")):
+        try:
+            m = __import__(mod, fromlist=["__version__"])
+            out[key] = str(getattr(m, "__version__", "unknown"))
+        except Exception:
+            pass
+    try:
+        import shutil
+
+        ptxas = shutil.which("ptxas") or "/usr/local/cuda/bin/ptxas"
+        txt = subprocess.run([ptxas, "--version"], capture_output=True,
+                             text=True, timeout=60).stdout
+        for line in txt.splitlines():
+            if "release" in line:
+                out["ptxas"] = line.strip()
+                break
+    except Exception:
+        pass
+    _TOOLCHAIN_CACHE.update(out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Register budget: computed, not swept (see the module docstring on .maxnreg)
+# ---------------------------------------------------------------------------
+def reg_cap_for_ctas(ntid: int, target_ctas: int,
+                     facts: dict | None = None) -> int:
+    """Registers per thread that leave room for ``target_ctas`` CTAs per SM.
+
+    ``regsPerMultiprocessor / (target_ctas * ntid)``, rounded down to the
+    8-register allocation granularity and clamped to the architectural
+    maximum. The only machine-dependent quantity is read here; how many
+    resident CTAs a given kernel wants is a property of the kernel, not of the
+    machine, so it stays with the kernel.
+
+    Returns 0 when the budget would exceed the architectural maximum, i.e.
+    when the request is already satisfied without a cap -- callers treat 0 as
+    "do not cap".
+    """
+    facts = machine_facts() if facts is None else facts
+    regs_per_sm = facts.get("regsPerMultiprocessor")
+    if not regs_per_sm or ntid <= 0 or target_ctas <= 0:
+        return 0
+    # The per-thread ceiling ptxas can encode. Also read, not written down.
+    ceiling = min(255, facts.get("regsPerBlock", 255) // max(ntid, 1))
+    cap = (regs_per_sm // (target_ctas * ntid)) // 8 * 8
+    if cap <= 0 or cap >= ceiling:
+        return 0
+    return cap
+
+
+def ctas_per_sm(regs: int, ntid: int, smem: int,
+                facts: dict | None = None) -> dict:
+    """Resident CTAs per SM implied by a compiled kernel's resource usage.
+
+    Used to detect a hint that was accepted syntactically and then dropped:
+    cuTile's ``occupancy=k`` is silently ignored whenever
+    ``k * smem_per_block`` exceeds the shared memory an SM has, so a candidate
+    can look distinct and compile to the same thing.
+    """
+    facts = machine_facts() if facts is None else facts
+    out = {}
+    if regs and ntid:
+        out["by_reg"] = facts["regsPerMultiprocessor"] // (regs * ntid)
+    if smem:
+        out["by_smem"] = facts["sharedMemPerMultiprocessor"] // smem
+    if ntid:
+        out["by_thread"] = facts["maxThreadsPerMultiProcessor"] // ntid
+    out["by_hw"] = facts.get("maxBlocksPerMultiProcessor", 32)
+    out["blocks"] = min(v for v in out.values() if v)
+    return out
+
+
+def pow2_upto(limit: int, divides: int, count: int) -> list:
+    """``count`` largest powers of two that are <= ``limit`` and divide.
+
+    A candidate generator, not a policy: the bound comes from the caller's
+    machine-derived ``limit`` and the shape's divisibility, so the list shrinks
+    on a smaller machine instead of staying at what one machine liked.
+    """
+    out = []
+    v = 1 << int(math.floor(math.log2(max(limit, 1))))
+    while v >= 1 and len(out) < count:
+        if divides % v == 0:
+            out.append(v)
+        v //= 2
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Cache key
+# ---------------------------------------------------------------------------
+# Dropping any component of this key does not produce an error; it produces a
+# configuration tuned for something else, applied silently. ``launch_shape`` is
+# stored verbatim and never bucketed, because two shapes in one bucket can have
+# different optima and bucketing hides that. If the number of entries ever
+# needs bounding, evict by age -- do not widen the key.
+def cache_key(name: str, launch_shape, dtypes, src_hash: str,
+              facts: dict | None = None, toolchain: dict | None = None,
+              extra=None) -> tuple:
+    facts = machine_facts() if facts is None else facts
+    toolchain = toolchain_facts() if toolchain is None else toolchain
+    machine = {k: v for k, v in sorted(facts.items())
+               if k not in ("uuid", "error", "arch")}
+    plain = {
+        "layout": CACHE_LAYOUT,
+        "kernel": name,
+        "arch": _arch(facts),
+        "machine": machine,
+        "toolchain": dict(sorted(toolchain.items())),
+        "src_sha1": src_hash,
+        "dtypes": [str(d) for d in dtypes],
+        "launch_shape": [int(v) for v in launch_shape],
+    }
+    if extra:
+        plain["extra"] = extra
+    blob = json.dumps(plain, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(blob.encode()).hexdigest()[:16], plain
+
+
+def source_hash(*objs) -> str:
+    """sha1 of the source of the functions/strings that define a kernel.
+
+    In the key so that editing a kernel invalidates its tuning instead of
+    running new code under an old configuration.
+    """
+    import inspect
+
+    h = hashlib.sha1()
+    for o in objs:
+        if isinstance(o, (bytes, bytearray)):
+            h.update(bytes(o))
+            continue
+        if isinstance(o, str):
+            h.update(o.encode())
+            continue
+        try:
+            fn = getattr(o, "_pyfunc", o)
+            h.update(inspect.getsource(fn).encode())
+        except (OSError, TypeError):
+            h.update(repr(o).encode())
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Cache directory: one file per key, atomic publish, advisory lock
+# ---------------------------------------------------------------------------
+def cache_dir() -> str:
+    d = os.environ.get("PADDLEFLEET_AUTOTUNE_CACHE_DIR")
+    if not d:
+        d = os.path.join(
+            os.environ.get("XDG_CACHE_HOME",
+                           os.path.expanduser("~/.cache")),
+            "paddlefleet", "autotune",
+        )
+    d = os.path.join(d, CACHE_LAYOUT)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _entry_path(name: str, key: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+    return os.path.join(cache_dir(), f"{safe}__{key}.json")
+
+
+def _read_entry(path: str):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        # A truncated read is what the atomic publish below prevents for
+        # writers; a reader that still sees one treats it as a miss.
+        return None
+
+
+def _publish(path: str, record: dict) -> None:
+    """Write then rename. A reader on another node cannot tell a partial file
+    from a complete one, so it must never see one."""
+    tmp = f"{path}.tmp.{os.getpid()}.{int(time.time() * 1e6)}"
+    with open(tmp, "w") as f:
+        json.dump(record, f, indent=1, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+class _Lock:
+    """``flock`` on a sidecar file; ``acquired`` is False if someone has it."""
+
+    def __init__(self, path: str, blocking: bool = True, timeout: float = 0.0):
+        self.path = path + ".lock"
+        self.blocking = blocking
+        self.timeout = timeout
+        self.fh = None
+        self.acquired = False
+
+    def __enter__(self):
+        try:
+            self.fh = open(self.path, "a+")
+        except OSError:
+            return self
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
+                return self
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    return self
+                if not self.blocking or time.time() > deadline:
+                    return self
+                time.sleep(0.2)
+
+    def __exit__(self, *_):
+        if self.fh is not None:
+            if self.acquired:
+                fcntl.flock(self.fh, fcntl.LOCK_UN)
+            self.fh.close()
+
+
+# ---------------------------------------------------------------------------
+# The bit-exactness gate
+# ---------------------------------------------------------------------------
+def raw_bytes(tensor) -> bytes:
+    """The tensor's storage, as bytes, with no dtype conversion.
+
+    ``Tensor.numpy()`` hands bfloat16 back as ``uint16`` and float16 as
+    ``float16``, both of which are the stored bit pattern, so this is a
+    byte-level view and not a comparison with a tolerance. A widening cast
+    here would be the difference between "bit-exact" and "close", which is the
+    whole point of the gate.
+    """
+    arr = tensor.numpy()
+    return arr.dtype.str.encode() + arr.shape.__repr__().encode() \
+        + arr.tobytes()
+
+
+def outputs_signature(tensors) -> str:
+    h = hashlib.sha1()
+    for t in tensors:
+        h.update(raw_bytes(t))
+    return h.hexdigest()
+def _first_diff(a, b) -> dict:
+    """Deprecated placeholder kept out of the public surface."""
+    raise NotImplementedError
+
+
+def explain_miss(name: str, key: str, plain: dict) -> str:
+    """Why an existing cache entry for this kernel was not applied.
+
+    A miss must never be silent: the failure mode being guarded against is a
+    configuration swept elsewhere being applied here, and its mirror image is
+    a cache that quietly stops being used. This walks the entries stored for
+    the same kernel and names the key components that differ.
+    """
+    others = []
+    try:
+        prefix = "".join(c if c.isalnum() or c in "._-" else "_"
+                         for c in name) + "__"
+        for fn in sorted(os.listdir(cache_dir())):
+            if fn.startswith(prefix) and fn.endswith(".json"):
+                others.append(os.path.join(cache_dir(), fn))
+    except OSError:
+        pass
+    if not others:
+        return (f"no cache entry for key {key} and none stored for {name} "
+                f"at all (first run on this machine/shape)")
+    parts = []
+    for path in others[:4]:
+        rec = _read_entry(path)
+        if not rec or "key_plain" not in rec:
+            continue
+        diff = []
+        for field in ("arch", "machine", "toolchain", "src_sha1", "dtypes",
+                      "launch_shape", "layout", "extra"):
+            mine, theirs = plain.get(field), rec["key_plain"].get(field)
+            if mine != theirs:
+                diff.append(field)
+        parts.append(f"{os.path.basename(path)} differs in {diff or ['?']}")
+    return (f"no cache entry for key {key}; {len(others)} entry(ies) exist "
+            f"for {name} but " + "; ".join(parts))
+# ---------------------------------------------------------------------------
+# Timing
+# ---------------------------------------------------------------------------
+MIN_WARMUP = 5
+MIN_ITERS = 20
+
+
+def time_median_us(fn, warmup: int = MIN_WARMUP, iters: int = MIN_ITERS
+                   ) -> dict:
+    """Median per-call microseconds over CUDA events.
+
+    The floors are not negotiable downwards: the first launches of a cuTile
+    kernel include its compilation, and a single sample lands anywhere in a
+    distribution whose spread is a few per cent.
+    """
+    import paddle
+
+    warmup = max(warmup, MIN_WARMUP)
+    iters = max(iters, MIN_ITERS)
+    for _ in range(warmup):
+        fn()
+    paddle.device.synchronize()
+    samples = []
+    for _ in range(iters):
+        e0 = paddle.device.cuda.Event(enable_timing=True)
+        e1 = paddle.device.cuda.Event(enable_timing=True)
+        e0.record()
+        fn()
+        e1.record()
+        e1.synchronize()
+        samples.append(e0.elapsed_time(e1) * 1000.0)
+    med = statistics.median(samples)
+    return {
+        "us": med,
+        "lo": min(samples),
+        "hi": max(samples),
+        "mad": statistics.median([abs(v - med) for v in samples]),
+        "n": len(samples),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Which rank am I
+# ---------------------------------------------------------------------------
+def global_rank() -> int:
+    for var in ("PADDLE_TRAINER_ID", "RANK", "OMPI_COMM_WORLD_RANK",
+                "PMI_RANK", "SLURM_PROCID"):
+        raw = os.environ.get(var)
+        if raw is not None:
+            try:
+                return int(raw)
+            except ValueError:
+                pass
+    return 0
+
+
+def _cfg_to_str(cfg: dict) -> str:
+    return ",".join(f"{k}={v}" for k, v in sorted(cfg.items()))
+
+
+def parse_config(text: str) -> dict:
+    """``TILE_C=128,TILE_SIZE=2`` -> dict of ints (or strings if not ints)."""
+    out: dict = {}
+    for part in text.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        k, _, v = part.partition("=")
+        v = v.strip()
+        try:
+            out[k.strip()] = int(v)
+        except ValueError:
+            out[k.strip()] = v
+    return out
+
+
+MAX_CANDIDATES = 8
+
+
+def _warn(msg: str) -> None:
+    warnings.warn(f"[paddlefleet.autotune] {msg}", stacklevel=3)
+    print(f"[paddlefleet.autotune] {msg}", file=sys.stderr, flush=True)
+
+
+_MEMO: dict = {}
+
+
+def tune(
+    name: str,
+    factory: dict,
+    candidates,
+    launch_shape,
+    dtypes,
+    src_hash: str,
+    make_outputs=None,
+    launch=None,
+    env_prefix: str = "PADDLEFLEET_AUTOTUNE",
+    warmup: int = MIN_WARMUP,
+    iters: int = MIN_ITERS,
+    input_sets: int = 1,
+    reseed=None,
+    hint_probe=None,
+    wait_timeout: float | None = None,
+    key_extra=None,
+) -> dict:
+    """Return the launch configuration to use for one kernel at one shape.
+
+    ``launch(cfg, outputs)`` performs exactly one launch; ``make_outputs()``
+    returns freshly allocated output tensors. Both are only called on the rank
+    that scans, and only on a cache miss. ``hint_probe(cfg)`` may return
+    ``{"requested": k, "blocks": m}`` for configurations that carry an
+    occupancy or CTA hint; a candidate whose hint did not survive compilation
+    is dropped with that recorded, because otherwise it is timed as if it were
+    a distinct configuration when it compiled to the same code.
+
+    Never raises: every failure path returns ``factory``.
+    """
+    if not _env_on(f"{env_prefix}_AUTOTUNE", True):
+        return dict(factory)
+
+    pinned = os.environ.get(f"{env_prefix}_PIN_{name.upper().replace('.', '_')}")
+    if pinned is None:
+        whole = os.environ.get(f"{env_prefix}_PIN")
+        if whole:
+            for chunk in whole.split(";"):
+                head, _, rest = chunk.partition(":")
+                if head.strip() == name:
+                    pinned = rest
+                    break
+    if pinned:
+        cfg = dict(factory)
+        cfg.update(parse_config(pinned))
+        return cfg
+
+    key, plain = cache_key(name, launch_shape, dtypes, src_hash,
+                           extra=key_extra)
+    memo = _MEMO.get(key)
+    if memo is not None:
+        return dict(memo)
+
+    path = _entry_path(name, key)
+    entry = _read_entry(path)
+    if entry is not None and entry.get("key") == key:
+        _MEMO[key] = entry["config"]
+        return dict(entry["config"])
+
+    if make_outputs is None or launch is None:
+        _warn(f"{name}: {explain_miss(name, key, plain)}, and this call site "
+              f"gave the tuner nothing to measure; using the factory "
+              f"configuration {_cfg_to_str(factory)}.")
+        return dict(factory)
+
+    rank = global_rank()
+    if rank != 0:
+        cfg = _wait_for_entry(name, key, path, factory, wait_timeout, plain)
+        _MEMO[key] = cfg
+        return dict(cfg)
+
+    with _Lock(path, blocking=True, timeout=600.0) as lock:
+        entry = _read_entry(path)
+        if entry is not None and entry.get("key") == key:
+            _MEMO[key] = entry["config"]
+            return dict(entry["config"])
+        if not lock.acquired:
+            _warn(f"{name}: could not take the scan lock for {path}.lock; "
+                  f"using the factory configuration "
+                  f"{_cfg_to_str(factory)}.")
+            return dict(factory)
+        try:
+            record = _scan(name, factory, candidates, plain, key,
+                           make_outputs, launch, warmup, iters,
+                           input_sets, reseed, hint_probe)
+        except Exception as exc:
+            _warn(f"{name}: scan failed ({type(exc).__name__}: {exc}); "
+                  f"using the factory configuration "
+                  f"{_cfg_to_str(factory)}.")
+            return dict(factory)
+        _publish(path, record)
+    _MEMO[key] = record["config"]
+    return dict(record["config"])
+
+
+def _wait_for_entry(name, key, path, factory, wait_timeout, plain):
+    """Other ranks wait; they do not scan.
+
+    N ranks timing the same kernel at the same moment contend for the same SMs
+    and measure each other, which is exactly the condition that voids a
+    reading.
+
+    ## The wait is only defensible if the cache directory is actually shared
+
+    Measured 2026-09-09 on a 64-rank / 8-node job: with the default cache
+    directory (``~/.cache/paddlefleet/autotune``, which is **per container**,
+    not the shared filesystem) rank 0 publishes where no other node can see it,
+    so every other rank waits the whole timeout and then falls back.  With four
+    tuned kernels and the old 600 s default that is up to 2400 s of startup on
+    every non-zero rank -- the job did not reach step 1 in 20 minutes and
+    looked like a hang rather than a misconfiguration.
+
+    Two changes came out of that:
+
+    * the default timeout is 120 s, not 600 s.  One scan is at most 8
+      candidates x (5 warmup + 20 timed) launches, i.e. seconds; a wait that
+      runs into minutes means the publish is not arriving at all, and waiting
+      longer will not fix it.
+    * the timeout warning prints **the path it watched**, so the
+      not-shared-directory case is one read away instead of a 20 minute
+      mystery.  Point ``PADDLEFLEET_AUTOTUNE_CACHE_DIR`` at shared storage.
+    """
+    if wait_timeout is None:
+        wait_timeout = float(os.environ.get(
+            "PADDLEFLEET_AUTOTUNE_WAIT_SECONDS", "120"))
+    deadline = time.time() + wait_timeout
+    while time.time() < deadline:
+        entry = _read_entry(path)
+        if entry is not None and entry.get("key") == key:
+            return entry["config"]
+        time.sleep(1.0)
+    _warn(f"{name}: {explain_miss(name, key, plain)} -- and rank 0 published "
+          f"nothing within {wait_timeout:.0f}s at {path}; using the factory "
+          f"configuration {_cfg_to_str(factory)}. (This rank does not scan on "
+          f"its own -- concurrent scans measure each other.  If that path is "
+          f"node-local rather than shared storage then rank 0 published where "
+          f"this rank cannot see it: set PADDLEFLEET_AUTOTUNE_CACHE_DIR to a "
+          f"shared directory.)")
+    return dict(factory)
+
+
+def _scan(name, factory, candidates, plain, key, make_outputs, launch,
+          warmup, iters, input_sets, reseed, hint_probe) -> dict:
+    """Gate on bytes, then rank on measured time. Records every rejection."""
+    import paddle
+
+    uniq = [dict(factory)]
+    for cfg in candidates:
+        merged = dict(factory)
+        merged.update(cfg)
+        if merged not in uniq:
+            uniq.append(merged)
+    if len(uniq) > MAX_CANDIDATES:
+        # A budget, not a preference: this runs inside the first training step.
+        uniq = uniq[:MAX_CANDIDATES]
+
+    t0 = time.time()
+    rejected = []
+    hints = []
+
+    # -- pass 1: bytes -------------------------------------------------------
+    references = []
+    for s in range(max(input_sets, 1)):
+        if s and reseed is not None:
+            reseed(s)
+        outs = make_outputs()
+        launch(uniq[0], outs)
+        paddle.device.synchronize()
+        references.append([raw_bytes(t) for t in outs])
+        del outs
+    survivors = [uniq[0]]
+    for cfg in uniq[1:]:
+        hint = None
+        bad = None
+        for s in range(max(input_sets, 1)):
+            if reseed is not None:
+                reseed(s)
+            outs = make_outputs()
+            try:
+                launch(cfg, outs)
+                paddle.device.synchronize()
+            except Exception as exc:
+                bad = {"input_set": s,
+                       "error": f"{type(exc).__name__}: {exc}"}
+                del outs
+                break
+            if s == 0 and hint_probe is not None:
+                # After the first launch, so that whatever the toolchain
+                # actually compiled exists to be looked at. A hint that was
+                # accepted syntactically and then dropped (cuTile drops
+                # ``occupancy=k`` whenever k CTAs of shared memory do not fit)
+                # compiles to the same code, and timing it again as if it were
+                # a distinct candidate is how a knob gets believed.
+                try:
+                    hint = hint_probe(cfg)
+                except Exception as exc:
+                    hint = {"error": f"{type(exc).__name__}: {exc}"}
+                if hint and hint.get("requested") and hint.get("blocks") \
+                        and hint["blocks"] < hint["requested"]:
+                    bad = {"hint": hint}
+                    del outs
+                    break
+            got = [raw_bytes(t) for t in outs]
+            if got != references[s]:
+                bad = {"input_set": s, "differing_outputs": [
+                    i for i, (a, b) in enumerate(zip(got, references[s]))
+                    if a != b]}
+                del outs
+                break
+            del outs
+        if bad is not None:
+            if "hint" in bad:
+                reason = "hint_reverted"
+            elif "error" in bad:
+                reason = "failed"
+            else:
+                reason = "not_bit_exact"
+            rejected.append({
+                "config": cfg,
+                "reason": reason,
+                "detail": bad,
+                "hint": hint,
+            })
+            continue
+        survivors.append(cfg)
+        if hint:
+            hints.append({"config": cfg, "hint": hint})
+    if reseed is not None:
+        reseed(0)
+    gate_seconds = time.time() - t0
+
+    # -- pass 2: measured time ----------------------------------------------
+    timings = []
+    for cfg in survivors:
+        outs = make_outputs()
+        launch(cfg, outs)
+        paddle.device.synchronize()
+        t = time_median_us(lambda cfg=cfg, outs=outs: launch(cfg, outs),
+                           warmup, iters)
+        del outs
+        timings.append({"config": cfg, **t})
+    timings.sort(key=lambda r: r["us"])
+    winner = timings[0]["config"]
+    base = next(r for r in timings if r["config"] == uniq[0])
+    for r in timings[1:]:
+        rejected.append({"config": r["config"], "reason": "slower",
+                         "us": r["us"],
+                         "vs_winner": r["us"] / timings[0]["us"]})
+
+    return {
+        "key": key,
+        "config": winner,
+        "factory": dict(factory),
+        "speedup_vs_factory": base["us"] / timings[0]["us"],
+        "bit_exact_vs_factory": True,
+        "bit_exact_input_sets": max(input_sets, 1),
+        "timings": timings,
+        "rejected": rejected,
+        "hints_accepted": hints,
+        "candidates_considered": len(uniq),
+        "gate_seconds": gate_seconds,
+        "scan_seconds": time.time() - t0,
+        "measured": {"warmup": max(warmup, MIN_WARMUP),
+                     "iters": max(iters, MIN_ITERS)},
+        "key_plain": plain,
+        "written_by": {
+            "rank": global_rank(),
+            "pid": os.getpid(),
+            "host": os.uname().nodename,
+            "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "device_uuid": machine_facts().get("uuid"),
+        },
+    }
