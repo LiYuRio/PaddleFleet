@@ -53,8 +53,7 @@ Three entry points
 ==============================  =========================================
 ``<PREFIX>_AUTOTUNE=0``         always the factory config; no cache, no scan
 ``<PREFIX>_PIN[_<NAME>]=k=v``   force one config; no cache, no scan
-default                         cache lookup; on a miss rank 0 scans, the
-                                other ranks wait for the cache
+default                         cache lookup; on a miss, scan
 ==============================  =========================================
 
 ``_PIN`` is not a debugging nicety. Autotuning and "the A/B differs in exactly
@@ -66,16 +65,24 @@ produced a published-then-retracted conclusion.)
 
 Who scans
 ---------
-Rank 0 scans under a file lock and publishes; every other rank waits for the
-file and, on timeout, falls back to the factory configuration with a warning.
-Other ranks must never scan: N ranks timing the same kernel on N GPUs of one
-node contend for the same SMs, and a single dirty card has been measured to
-slow a tightly-coupled job 2.1x -- the timings would be noise.
+Whoever takes the lock. There is no leader and no rank arithmetic.
 
-The cache is a directory of one JSON file per key, written to a temporary name
-and ``os.replace``d into place, because a reader on another node that catches a
-half-written file has no way to tell. Point ``PADDLEFLEET_AUTOTUNE_CACHE_DIR``
-at shared storage so that every rank sees what rank 0 published.
+Processes that share a cache directory serialise on one lock per key: the first
+one scans, the others block, and when they wake the entry is already there, so
+they read it and return. Wall time is one scan either way, but only one process
+per directory does the compiling and the timing -- which matters, because it
+keeps a sibling's compilation off the CPU while a measurement is in flight.
+Processes that do not share a directory never meet and do not need to: they own
+different GPUs, the timing runs on CUDA events, so there is no shared resource
+to contend for. If the lock cannot be taken, the process scans anyway on its
+own device; that costs duplicated work, not a corrupt reading.
+
+The cache is therefore an optimisation, never a rendezvous. Nothing has to be
+visible to anyone else for the tuning to be correct, which is what lets the
+directory be node local -- see :func:`cache_dir`.
+
+Each entry is one JSON file, written to a temporary name and ``os.replace``d
+into place, so a reader can never catch a half-written file.
 """
 
 from __future__ import annotations
@@ -342,14 +349,54 @@ def source_hash(*objs) -> str:
 # ---------------------------------------------------------------------------
 # Cache directory: one file per key, atomic publish, advisory lock
 # ---------------------------------------------------------------------------
+#: How long to block on another process's scan before giving up and scanning
+#: too. Sized against the scans themselves, not guessed: the slowest entry
+#: measured on a production shape took 22.3 s, and the cost of overshooting is
+#: only duplicated work on a GPU this process owns anyway.
+_LOCK_WAIT_SECONDS = 120.0
+
+#: Cache root when the host framework has one. Reading it means the tuning
+#: results live under the same tree as every other JIT cache, and are carried
+#: between nodes by whatever already distributes that tree.
+_HOST_CACHE_ROOT_ENV = "KERNEL_WARMUP_CACHE_ROOT"
+
+
 def cache_dir() -> str:
+    """Where tuning results are kept. **Node local is fine and is the default.**
+
+    This used to default to ``~/.cache/paddlefleet/autotune`` while the rest of
+    the module assumed every rank could see what one designated rank published.
+    On a multi-node job ``$HOME`` is per container, so the publisher wrote where
+    nobody else could read, every other rank waited out its timeout, and the
+    whole job silently ran on the factory configuration. Startup went past
+    twenty minutes and looked like a hang rather than a misconfiguration.
+
+    The lookup is no longer a rendezvous -- any process that misses simply scans
+    on its own GPU (see the module docstring) -- so a node-local directory is
+    correct, not a compromise. Two consequences worth stating:
+
+    * Nothing breaks when the directory is not shared. That is the property the
+      old default silently lacked.
+    * Riding the host framework's cache root (``KERNEL_WARMUP_CACHE_ROOT``, if
+      it is set) means the results sit alongside the Triton / cuTile / other JIT
+      caches and are carried between nodes by whatever already ships that tree,
+      so the scan is paid once per cluster rather than once per node -- without
+      this module having to know how that distribution works, or requiring it.
+
+    Precedence: ``PADDLEFLEET_AUTOTUNE_CACHE_DIR`` (explicit, wins), then the
+    host cache root, then a per-user directory.
+    """
     d = os.environ.get("PADDLEFLEET_AUTOTUNE_CACHE_DIR")
     if not d:
-        d = os.path.join(
-            os.environ.get("XDG_CACHE_HOME",
-                           os.path.expanduser("~/.cache")),
-            "paddlefleet", "autotune",
-        )
+        root = os.environ.get(_HOST_CACHE_ROOT_ENV)
+        if root and root.strip():
+            d = os.path.join(root.strip().rstrip("/"), "autotune")
+        else:
+            d = os.path.join(
+                os.environ.get("XDG_CACHE_HOME",
+                               os.path.expanduser("~/.cache")),
+                "paddlefleet", "autotune",
+            )
     d = os.path.join(d, CACHE_LAYOUT)
     os.makedirs(d, exist_ok=True)
     return d
@@ -518,23 +565,31 @@ def time_median_us(fn, warmup: int = MIN_WARMUP, iters: int = MIN_ITERS
     }
 
 
-# ---------------------------------------------------------------------------
-# Which rank am I
-# ---------------------------------------------------------------------------
-def global_rank() -> int:
-    for var in ("PADDLE_TRAINER_ID", "RANK", "OMPI_COMM_WORLD_RANK",
-                "PMI_RANK", "SLURM_PROCID"):
-        raw = os.environ.get(var)
-        if raw is not None:
-            try:
-                return int(raw)
-            except ValueError:
-                pass
-    return 0
-
-
 def _cfg_to_str(cfg: dict) -> str:
     return ",".join(f"{k}={v}" for k, v in sorted(cfg.items()))
+
+
+def _framework_rank():
+    """Rank for the provenance record only. ``None`` when it cannot be had.
+
+    Deliberately asks the framework instead of reading launcher environment
+    variables. An earlier version of this module walked a list of five variable
+    names (``PADDLE_TRAINER_ID``, ``RANK``, ``OMPI_COMM_WORLD_RANK``, ...) and
+    returned 0 when none matched. That is a guess whose ordering is load
+    bearing: under ``mpirun`` plus a launcher, ``OMPI_COMM_WORLD_RANK`` is
+    inherited by every process on a node and equals the node index, so if the
+    first name in the list ever stops being set, every process on a node reports
+    the same rank. It never raised, it just answered wrongly.
+
+    Nothing depends on the answer any more -- who scans is decided by the lock --
+    so this is pure provenance and is allowed to be unknown.
+    """
+    try:
+        import paddle.distributed as dist
+
+        return dist.get_rank()
+    except Exception:  # noqa: BLE001 - provenance must never break a scan
+        return None
 
 
 def parse_config(text: str) -> dict:
@@ -579,14 +634,14 @@ def tune(
     input_sets: int = 1,
     reseed=None,
     hint_probe=None,
-    wait_timeout: float | None = None,
     key_extra=None,
 ) -> dict:
     """Return the launch configuration to use for one kernel at one shape.
 
     ``launch(cfg, outputs)`` performs exactly one launch; ``make_outputs()``
-    returns freshly allocated output tensors. Both are only called on the rank
-    that scans, and only on a cache miss. ``hint_probe(cfg)`` may return
+    returns freshly allocated output tensors. Both are only called by the
+    process that ends up scanning, and only on a cache miss. ``hint_probe(cfg)``
+    may return
     ``{"requested": k, "blocks": m}`` for configurations that carry an
     occupancy or CTA hint; a candidate whose hint did not survive compilation
     is dropped with that recorded, because otherwise it is timed as if it were
@@ -629,22 +684,46 @@ def tune(
               f"configuration {_cfg_to_str(factory)}.")
         return dict(factory)
 
-    rank = global_rank()
-    if rank != 0:
-        cfg = _wait_for_entry(name, key, path, factory, wait_timeout, plain)
-        _MEMO[key] = cfg
-        return dict(cfg)
-
-    with _Lock(path, blocking=True, timeout=600.0) as lock:
+    # ---- who scans: whoever gets the lock, and nobody waits on a rank -------
+    # There used to be a "global rank 0 scans, every other rank waits for it to
+    # publish" branch here. It was wrong twice over.
+    #
+    # The premise was that concurrent scans measure each other, which is only
+    # true when several processes share one GPU. In a job with one rank per GPU
+    # they do not share the resource being measured, and the timing below runs
+    # on CUDA events, i.e. on the GPU timeline. So there is nothing to serialise
+    # across GPUs.
+    #
+    # And "global rank" was the wrong unit anyway: it made the ranks that own
+    # the other GPUs on this node sit idle, while two jobs sharing a node would
+    # both have a "rank 0" scanning at the same time without either noticing.
+    # Determining it also meant guessing at launcher environment variables, and
+    # guessing wrong did not raise -- a process wrongly deciding it was not rank
+    # 0 waited out the timeout and then used the factory configuration for the
+    # rest of the run.
+    #
+    # The lock alone does the whole job, on the right unit. Ranks that share a
+    # cache directory (i.e. that are on one node, since the directory is node
+    # local) serialise on it: the first one scans, the rest block, and when they
+    # wake the entry is already there, so they read it and return. Wall time is
+    # one scan either way, but only one GPU per node does the work and only one
+    # process per node is compiling -- which also keeps sibling compilation off
+    # the CPU while a measurement is running. Different nodes never meet, and do
+    # not need to.
+    with _Lock(path, blocking=True, timeout=_LOCK_WAIT_SECONDS) as lock:
         entry = _read_entry(path)
         if entry is not None and entry.get("key") == key:
             _MEMO[key] = entry["config"]
             return dict(entry["config"])
         if not lock.acquired:
-            _warn(f"{name}: could not take the scan lock for {path}.lock; "
-                  f"using the factory configuration "
-                  f"{_cfg_to_str(factory)}.")
-            return dict(factory)
+            # Not a reason to give up on tuning: this process owns its own GPU,
+            # so scanning without the lock costs duplicated work, not a corrupt
+            # reading, and ``_publish`` renames into place atomically. Falling
+            # back to the factory configuration here is what used to make a
+            # contended start silently permanent.
+            _warn(f"{name}: could not take the scan lock for {path}.lock "
+                  f"within {_LOCK_WAIT_SECONDS:.0f}s; scanning anyway on this "
+                  f"process's own device.")
         try:
             record = _scan(name, factory, candidates, plain, key,
                            make_outputs, launch, warmup, iters,
@@ -657,52 +736,6 @@ def tune(
         _publish(path, record)
     _MEMO[key] = record["config"]
     return dict(record["config"])
-
-
-def _wait_for_entry(name, key, path, factory, wait_timeout, plain):
-    """Other ranks wait; they do not scan.
-
-    N ranks timing the same kernel at the same moment contend for the same SMs
-    and measure each other, which is exactly the condition that voids a
-    reading.
-
-    ## The wait is only defensible if the cache directory is actually shared
-
-    Measured 2026-09-09 on a 64-rank / 8-node job: with the default cache
-    directory (``~/.cache/paddlefleet/autotune``, which is **per container**,
-    not the shared filesystem) rank 0 publishes where no other node can see it,
-    so every other rank waits the whole timeout and then falls back.  With four
-    tuned kernels and the old 600 s default that is up to 2400 s of startup on
-    every non-zero rank -- the job did not reach step 1 in 20 minutes and
-    looked like a hang rather than a misconfiguration.
-
-    Two changes came out of that:
-
-    * the default timeout is 120 s, not 600 s.  One scan is at most 8
-      candidates x (5 warmup + 20 timed) launches, i.e. seconds; a wait that
-      runs into minutes means the publish is not arriving at all, and waiting
-      longer will not fix it.
-    * the timeout warning prints **the path it watched**, so the
-      not-shared-directory case is one read away instead of a 20 minute
-      mystery.  Point ``PADDLEFLEET_AUTOTUNE_CACHE_DIR`` at shared storage.
-    """
-    if wait_timeout is None:
-        wait_timeout = float(os.environ.get(
-            "PADDLEFLEET_AUTOTUNE_WAIT_SECONDS", "120"))
-    deadline = time.time() + wait_timeout
-    while time.time() < deadline:
-        entry = _read_entry(path)
-        if entry is not None and entry.get("key") == key:
-            return entry["config"]
-        time.sleep(1.0)
-    _warn(f"{name}: {explain_miss(name, key, plain)} -- and rank 0 published "
-          f"nothing within {wait_timeout:.0f}s at {path}; using the factory "
-          f"configuration {_cfg_to_str(factory)}. (This rank does not scan on "
-          f"its own -- concurrent scans measure each other.  If that path is "
-          f"node-local rather than shared storage then rank 0 published where "
-          f"this rank cannot see it: set PADDLEFLEET_AUTOTUNE_CACHE_DIR to a "
-          f"shared directory.)")
-    return dict(factory)
 
 
 def _scan(name, factory, candidates, plain, key, make_outputs, launch,
@@ -830,7 +863,7 @@ def _scan(name, factory, candidates, plain, key, make_outputs, launch,
                      "iters": max(iters, MIN_ITERS)},
         "key_plain": plain,
         "written_by": {
-            "rank": global_rank(),
+            "rank": _framework_rank(),
             "pid": os.getpid(),
             "host": os.uname().nodename,
             "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
