@@ -126,6 +126,11 @@ class TestSonicMoELayerPrecision(unittest.TestCase):
 
         from paddlefleet.transformer.moe import fusion_layer_utils, moe_expert
 
+        # moe_expert resolves its SonicMoE symbols on demand (MoELayer.__init__
+        # does it in a real run). Trigger it here so this test does not depend
+        # on another test in this class having built a layer first.
+        moe_expert._load_sonic_symbols()
+
         expected_run_sonic_moe = getattr(
             sonicmoe, "run_sonic_moe", fusion_layer_utils.run_sonic_moe
         )

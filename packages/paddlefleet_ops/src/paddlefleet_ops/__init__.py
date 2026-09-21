@@ -376,7 +376,15 @@ def load_sonic_moe():
     if _SONIC_MOE_LOADED:
         return globals()["sonicmoe"]
     if not is_sonic_moe_available():
-        raise RuntimeError(blocked_import_messages["paddlefleet_ops.sonicmoe"])
+        # .get(): the blocked_import_messages entry is only registered on CUDA
+        # builds, so a CPU-only build would otherwise raise KeyError here.
+        raise RuntimeError(
+            blocked_import_messages.get(
+                "paddlefleet_ops.sonicmoe",
+                "paddlefleet_ops.sonicmoe is not available in this build. "
+                + SONIC_MOE_HINT,
+            )
+        )
     with paddle.use_compat_guard(
         enable=True, scope={"sonicmoe", "quack", "triton"}, silent=True
     ):
